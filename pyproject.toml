@@ -5,5 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "datetime>=5.5",
+    "fitparse>=1.2.0",
+    "folium>=0.20.0",
     "garminexport>=0.6.0",
+    "logger>=1.4",
+    "nbformat>=5.10.4",
+    "pandas>=2.3.2",
+    "plotly>=6.3.1",
 ]
