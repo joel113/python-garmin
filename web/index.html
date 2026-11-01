@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Garmin Activity Library</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><link rel="stylesheet" href="/style.css"></head>
-<body><nav class="sidebar" aria-label="Main navigation"><div class="brand">Garmin<span>Activity Library</span></div><button data-view="summary" aria-current="page">Summary</button><button data-view="heat">Heatmap</button><button data-view="tracks">Single tracks</button></nav>
+<body><nav class="sidebar" aria-label="Main navigation"><div class="brand">Garmin<span>Activity Library</span></div><button data-view="summary" aria-current="page">Summary</button><button data-view="heat">Heatmap</button><button data-view="tracks">Tracks</button><button data-view="segments">Segments</button></nav>
 <main><p id="error" role="alert" hidden></p>
 <section id="summary" class="view"><header><h1>Summary</h1><p id="date-range" class="muted">Loading activities…</p></header><div id="cards" class="cards"></div>
 <article class="panel comparison"><h2>Compare periods</h2>
@@ -8,5 +8,22 @@
 <div id="comparison-results" aria-live="polite"></div><p id="comparison-note" class="small"></p></article>
 <div class="panels"><article class="panel"><h2>Activities by sport</h2><div id="sports"></div></article><article class="panel"><h2>Recent activities</h2><div id="recent"></div></article></div></section>
 <section id="heat" class="view map-view" hidden><header><div><h1>Heatmap</h1><p id="heat-description" class="muted">All routes together. Brighter paths show repeated visits.</p></div><div class="map-controls"><label>Sport<select id="sport-filter"><option value="all">All sports</option></select></label><label>Display mode<select id="heat-mode"><option value="density">Overlapping routes</option><option value="individual">Individual tracks</option></select></label><label>Route color<input id="heat-color" type="color" value="#087e8b"></label></div></header><p id="heat-status" class="status" role="status"></p><div id="heatmap" class="map" aria-label="All activity routes"></div></section>
-<section id="tracks" class="view map-view" hidden><header><h1>Single tracks</h1></header><div class="track-layout"><aside class="activity-list"><label class="search">Search activities<input id="search" type="search" placeholder="Date, sport or activity ID"></label><div id="activities"></div></aside><div class="track-map"><p id="track-status" class="status" role="status">Select an activity.</p><div id="map" class="map" aria-label="Selected activity route"></div></div></div></section>
-</main><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="/app.js" defer></script></body></html>
+<section id="tracks" class="view map-view" hidden><header><h1>Tracks</h1></header><div class="track-layout"><aside class="activity-list"><label class="search">Search activities<input id="search" type="search" placeholder="Date, sport or activity ID"></label><div id="activities"></div></aside><div class="track-map"><p id="track-status" class="status" role="status">Select an activity.</p><div id="map" class="map" aria-label="Selected activity route"></div></div></div></section>
+<section id="segments" class="view map-view" hidden>
+<header><div><h1>Segments</h1><p class="muted">Your checkpoints, repeated journeys, and personal bests.</p></div><button id="segment-new" class="primary">New segment</button></header>
+<p id="segment-message" class="status" role="status"></p>
+<div class="segment-layout"><aside class="segment-sidebar">
+<div id="segment-list" aria-label="Saved segments"></div>
+<form id="segment-editor" hidden>
+<h2 id="segment-editor-title">New segment</h2>
+<label>Name<input id="segment-name" required maxlength="120" autocomplete="off"></label>
+<label>Sport<select id="segment-sport" required></select></label>
+<label>GPS tolerance (metres)<input id="segment-radius" type="number" min="5" max="500" value="30" required></label>
+<p class="small">Click the map to place checkpoints in order. Drag a marker to move it. One checkpoint counts visits; multiple checkpoints measure forward traversals.</p>
+<ol id="segment-checkpoints"></ol><button id="segment-undo" type="button">Undo checkpoint change</button>
+<div class="segment-actions"><button type="submit" class="primary">Save segment</button><button id="segment-cancel" type="button">Cancel</button></div>
+</form>
+<div id="segment-detail" hidden><h2 id="segment-title"></h2><p id="segment-info" class="small"></p><div class="segment-actions"><button id="segment-edit">Edit</button><button id="segment-delete" class="danger">Delete</button></div><div id="segment-stats"></div><p class="small">Select a traversal to highlight its path. Open activity to see its full track.</p><div id="segment-traversals"></div><div class="segment-actions"><button id="segment-prev">Previous</button><span id="segment-page" class="small"></span><button id="segment-next">Next</button></div></div>
+</aside><div id="segment-map" class="map" aria-label="Segment checkpoints and matching activities"></div></div>
+</section>
+</main><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="/app.js" defer></script><script src="/segments.js" defer></script></body></html>

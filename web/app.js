@@ -48,6 +48,7 @@ function summary() {
   $("#compare-sport").replaceChildren(new Option("All sports","all"));
   [...sports.keys()].sort().forEach(key=>$("#compare-sport").add(new Option(sportName(key),key)));
   populateComparisonPeriods();
+  if (window.segmentUI) window.segmentUI.setSports();
 }
 // Use the recorded calendar date consistently for FIT and GPX timestamps.
 // UTC arithmetic avoids browser timezone shifts and daylight-saving changes.
@@ -203,17 +204,20 @@ async function showHeat() {
   } catch(error) { $("#heat-status").textContent="Could not load routes."; report(error); }
 }
 function switchView(view) {
+  if (window.segmentUI && !window.segmentUI.allowNavigate(view)) return false;
   document.querySelectorAll(".view").forEach(section=>section.hidden=section.id!==view);
   document.querySelectorAll("[data-view]").forEach(button=>{if(button.dataset.view===view) button.setAttribute("aria-current","page"); else button.removeAttribute("aria-current");});
   requestAnimationFrame(()=>{
     try {
       if (view==="heat") showHeat();
+      if (view==="segments") window.segmentUI.show();
       if (view==="tracks") {
         getMap("map");
         if (!selected) { const first=activities.find(a=>a.has_track); if (first) showTrack(first.id); }
       }
     } catch(error) { report(error); }
   });
+  return true;
 }
 document.querySelectorAll("[data-view]").forEach(button=>button.onclick=()=>switchView(button.dataset.view));
 $("#sport-filter").onchange=showHeat; $("#search").oninput=renderList;

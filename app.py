@@ -12,6 +12,8 @@ import sys
 import csv
 import time
 import math
+import threading
+from contextlib import closing
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from itertools import chain, groupby
@@ -54,7 +56,7 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
 
 
 def connect():
-    db = sqlite3.connect(DB_PATH)
+    db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript("""
       CREATE TABLE IF NOT EXISTS activities (
@@ -67,6 +69,31 @@ def connect():
         timestamp TEXT, altitude REAL, PRIMARY KEY(activity_id, seq)
       );
       CREATE INDEX IF NOT EXISTS track_activity_idx ON track_points(activity_id, seq);
+      CREATE TABLE IF NOT EXISTS segments (
+        id INTEGER PRIMARY KEY, name TEXT NOT NULL, sport TEXT NOT NULL,
+        radius_m REAL NOT NULL DEFAULT 30, revision INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'pending', error TEXT,
+        progress_done INTEGER NOT NULL DEFAULT 0, progress_total INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS segment_checkpoints (
+        segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+        PRIMARY KEY(segment_id,seq)
+      );
+      CREATE TABLE IF NOT EXISTS segment_traversals (
+        id INTEGER PRIMARY KEY, segment_id INTEGER NOT NULL REFERENCES segments(id) ON DELETE CASCADE,
+        activity_id TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+        ordinal INTEGER NOT NULL, start_pos REAL NOT NULL, end_pos REAL NOT NULL,
+        start_time TEXT, end_time TEXT, duration_s REAL,
+        UNIQUE(segment_id,activity_id,ordinal)
+      );
+      CREATE INDEX IF NOT EXISTS traversal_segment_idx ON segment_traversals(segment_id,duration_s);
+      CREATE TABLE IF NOT EXISTS activity_bounds (
+        activity_id TEXT PRIMARY KEY REFERENCES activities(id) ON DELETE CASCADE,
+        min_lat REAL, max_lat REAL, min_lon REAL, max_lon REAL
+      );
     """)
     db.execute("PRAGMA foreign_keys = ON")
     return db
@@ -102,7 +129,24 @@ def distance_between(a, b):
     lat1, lat2 = math.radians(a[0]), math.radians(b[0])
     dlat, dlon = lat2 - lat1, math.radians(b[1] - a[1])
     hav = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return 2 * radius * math.asin(math.sqrt(hav))
+    return 2 * radius * math.asin(math.sqrt(min(1, hav)))
+
+
+def point_time(raw_time):
+    try:
+        value = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        return (value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value).timestamp()
+    except (AttributeError, ValueError, TypeError):
+        return None
+
+
+def gps_discontinuity(previous, current):
+    distance = distance_between(previous, current)
+    elapsed = current[2] - previous[2] if current[2] is not None and previous[2] is not None else None
+    if elapsed is None:
+        return distance > 10_000
+    return (elapsed < 0 or (elapsed > 300 and distance > 500) or
+            (distance > 300 and (elapsed <= 0 or distance / elapsed > 55)))
 
 
 def display_segments(rows, stride=1):
@@ -128,16 +172,7 @@ def display_segments(rows, stride=1):
         except (AttributeError, ValueError, TypeError):
             seconds = None
         coordinate = [lat, lon]
-        discontinuity = False
-        if previous is not None:
-            distance = distance_between(previous, coordinate)
-            elapsed = seconds - previous[2] if seconds is not None and previous[2] is not None else None
-            if elapsed is None:
-                discontinuity = distance > 10_000
-            else:
-                discontinuity = (elapsed < 0 or
-                                 (elapsed > 300 and distance > 500) or
-                                 (distance > 300 and (elapsed <= 0 or distance / elapsed > 55)))
+        discontinuity = previous is not None and gps_discontinuity(previous, (lat, lon, seconds))
         if discontinuity:
             finish()
             segment, count = [], 0
@@ -182,10 +217,17 @@ def import_file(db: sqlite3.Connection, path: Path) -> bool:
                     continue
                 points.append((aid, len(points), lat * 180 / 2**31, lon * 180 / 2**31,
                                str(record.get_value("timestamp") or ""), record.get_value("altitude")))
+        old = db.execute("SELECT sport FROM activities WHERE id=?", (aid,)).fetchone()
         db.execute("DELETE FROM activities WHERE id=?", (aid,))
         db.execute("INSERT INTO activities(id,file_path,start_time,sport,duration_s,distance_m) VALUES(?,?,?,?,?,?)",
                    (aid, str(path.relative_to(ROOT)), str(meta["start_time"] or ""), meta["sport"], meta["duration_s"], meta["distance_m"]))
         db.executemany("INSERT INTO track_points(activity_id,seq,lat,lon,timestamp,altitude) VALUES(?,?,?,?,?,?)", points)
+        if points:
+            db.execute("INSERT INTO activity_bounds VALUES(?,?,?,?,?)", (aid,
+                       min(p[2] for p in points), max(p[2] for p in points),
+                       min(p[3] for p in points), max(p[3] for p in points)))
+        db.execute("UPDATE segments SET revision=revision+1,status='pending',error=NULL,progress_done=0,progress_total=0 WHERE sport IN (?,?)",
+                   (meta["sport"], old[0] if old else meta["sport"]))
         db.commit()
         return True
     except Exception:
@@ -342,11 +384,216 @@ def fetch_new():
     print(f"Downloaded and imported {downloaded} new activities")
 
 
+def circle_entry(a, b, checkpoint, radius):
+    """First intersection fraction of a GPS edge with a checkpoint circle."""
+    lat, lon = checkpoint
+    scale_x = 111_195 * math.cos(math.radians(lat))
+    ax, ay = (a[1] - lon) * scale_x, (a[0] - lat) * 111_195
+    bx, by = (b[1] - lon) * scale_x, (b[0] - lat) * 111_195
+    if ax * ax + ay * ay <= radius * radius:
+        return 0.0
+    dx, dy = bx - ax, by - ay
+    square = dx * dx + dy * dy
+    if square == 0:
+        return None
+    dot = ax * dx + ay * dy
+    discriminant = dot * dot - square * (ax * ax + ay * ay - radius * radius)
+    if discriminant < 0:
+        return None
+    fraction = (-dot - math.sqrt(discriminant)) / square
+    return fraction if 0 <= fraction <= 1 else None
+
+
+def match_segment(rows, checkpoints, radius):
+    """Yield visits/forward attempts using every point and interpolated crossings."""
+    armed = [True] * len(checkpoints)
+    previous = None
+    attempt = None
+    for row in rows:
+        current = (row["lat"], row["lon"], point_time(row["timestamp"]), row["seq"])
+        if previous is None or gps_discontinuity(previous, current):
+            previous = current
+            armed = [True] * len(checkpoints)
+            attempt = None
+            a = current
+        else:
+            a = previous
+        if attempt and (a[2] is None or current[2] is None):
+            attempt["valid"] = False
+        events = []
+        for index, checkpoint in enumerate(checkpoints):
+            if armed[index]:
+                fraction = circle_entry(a, current, checkpoint, radius)
+                if fraction is not None:
+                    position = a[3] + fraction * (current[3] - a[3])
+                    seconds = a[2] + fraction * (current[2] - a[2]) if a[2] is not None and current[2] is not None else None
+                    events.append((position, index, seconds))
+                    armed[index] = False
+            if distance_between(current, checkpoint) > radius * 1.5:
+                armed[index] = True
+        for position, index, seconds in sorted(events):
+            if len(checkpoints) == 1:
+                yield (position, position, seconds, seconds, None)
+            elif index == 0:
+                attempt = {"start": position, "last": position, "time": seconds,
+                           "next": 1, "valid": seconds is not None and a[2] is not None and current[2] is not None}
+            elif attempt and index == attempt["next"] and position > attempt["last"]:
+                attempt["last"] = position
+                attempt["next"] += 1
+                if seconds is None:
+                    attempt["valid"] = False
+                if attempt["next"] == len(checkpoints):
+                    duration = seconds - attempt["time"] if attempt["valid"] and seconds is not None else None
+                    if duration is not None and duration <= 0:
+                        duration = None
+                    yield (attempt["start"], position, attempt["time"], seconds, duration)
+                    attempt = None
+        previous = current
+
+
+def iso_time(seconds):
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat() if seconds is not None else None
+
+
+def segment_worker(stop):
+    """Publish cached matches only if the processed revision is still current."""
+    try:
+        with closing(connect()) as db:
+            db.execute("UPDATE segments SET status='pending' WHERE status='processing'")
+            db.execute("""INSERT OR IGNORE INTO activity_bounds
+                SELECT activity_id,MIN(lat),MAX(lat),MIN(lon),MAX(lon)
+                FROM track_points WHERE activity_id NOT IN (SELECT activity_id FROM activity_bounds)
+                GROUP BY activity_id""")
+            db.commit()
+    except Exception:
+        LOG.exception("Could not initialize segment matching")
+        return
+    while not stop.is_set():
+        sid, revision = None, None
+        try:
+            with closing(connect()) as db:
+                job = db.execute("SELECT * FROM segments WHERE status='pending' ORDER BY updated_at,id LIMIT 1").fetchone()
+                if job is None:
+                    stop.wait(1)
+                    continue
+                sid, revision = job["id"], job["revision"]
+                db.execute("UPDATE segments SET status='processing',error=NULL WHERE id=? AND revision=?", (sid, revision))
+                db.commit()
+                checkpoints = [(r["lat"], r["lon"]) for r in db.execute(
+                    "SELECT lat,lon FROM segment_checkpoints WHERE segment_id=? ORDER BY seq", (sid,))]
+                if not checkpoints:
+                    continue
+                radius = job["radius_m"]
+                lat_pad = radius / 111_195
+                lon_pad = radius / (111_195 * max(0.001, min(math.cos(math.radians(p[0])) for p in checkpoints)))
+                candidates = db.execute("""SELECT a.id FROM activities a JOIN activity_bounds b ON b.activity_id=a.id
+                    WHERE a.sport=? AND b.max_lat>=? AND b.min_lat<=? AND b.max_lon>=? AND b.min_lon<=?""",
+                    (job["sport"], max(p[0] for p in checkpoints) - lat_pad,
+                     min(p[0] for p in checkpoints) + lat_pad,
+                     max(p[1] for p in checkpoints) - lon_pad, min(p[1] for p in checkpoints) + lon_pad)).fetchall()
+                db.execute("UPDATE segments SET progress_total=?,progress_done=0 WHERE id=? AND revision=?",
+                           (len(candidates), sid, revision))
+                db.commit()
+                matches = []
+                for done, activity in enumerate(candidates, 1):
+                    current = db.execute("SELECT revision FROM segments WHERE id=?", (sid,)).fetchone()
+                    if stop.is_set() or current is None or current[0] != revision:
+                        break
+                    records = db.execute("SELECT seq,lat,lon,timestamp FROM track_points WHERE activity_id=? ORDER BY seq",
+                                         (activity["id"],)).fetchall()
+                    for ordinal, match in enumerate(match_segment(records, checkpoints, radius), 1):
+                        start, end, start_time, end_time, duration = match
+                        matches.append((sid, activity["id"], ordinal, start, end,
+                                        iso_time(start_time), iso_time(end_time), duration))
+                    db.execute("UPDATE segments SET progress_done=? WHERE id=? AND revision=?", (done, sid, revision))
+                    db.commit()
+                if stop.is_set():
+                    continue
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute("SELECT revision FROM segments WHERE id=?", (sid,)).fetchone()
+                if current is not None and current[0] == revision:
+                    db.execute("DELETE FROM segment_traversals WHERE segment_id=?", (sid,))
+                    db.executemany("""INSERT INTO segment_traversals
+                        (segment_id,activity_id,ordinal,start_pos,end_pos,start_time,end_time,duration_s)
+                        VALUES(?,?,?,?,?,?,?,?)""", matches)
+                    db.execute("UPDATE segments SET status='completed',error=NULL WHERE id=?", (sid,))
+                db.commit()
+        except Exception:
+            LOG.exception("Segment matching failed for segment %s", sid)
+            if sid is not None:
+                with closing(connect()) as db:
+                    db.execute("UPDATE segments SET status='failed',error='Matching failed. Edit and save the segment to retry.' WHERE id=? AND revision=?",
+                               (sid, revision))
+                    db.commit()
+            stop.wait(1)
+
+
+class SegmentError(Exception):
+    def __init__(self, status, message):
+        self.status, self.message = status, message
+
+
+def segment_detail(db, sid):
+    row = db.execute("SELECT * FROM segments WHERE id=?", (sid,)).fetchone()
+    if row is None:
+        raise SegmentError(404, "Segment not found.")
+    result = dict(row)
+    result["checkpoints"] = [list(p) for p in db.execute(
+        "SELECT lat,lon FROM segment_checkpoints WHERE segment_id=? ORDER BY seq", (sid,))]
+    result.update(traversal_count=0, activity_count=0, fastest=None)
+    if row["status"] == "completed":
+        counts = db.execute("SELECT COUNT(*),COUNT(DISTINCT activity_id) FROM segment_traversals WHERE segment_id=?", (sid,)).fetchone()
+        result["traversal_count"], result["activity_count"] = counts
+        fastest = db.execute("SELECT * FROM segment_traversals WHERE segment_id=? AND duration_s IS NOT NULL ORDER BY duration_s,id LIMIT 1", (sid,)).fetchone()
+        result["fastest"] = dict(fastest) if fastest else None
+    return result
+
+
+def validate_segment(db, payload):
+    name, sport = payload.get("name"), payload.get("sport")
+    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 120:
+        raise SegmentError(400, "Enter a segment name of 1–120 characters.")
+    if not isinstance(sport, str) or not db.execute("SELECT 1 FROM activities WHERE sport=? LIMIT 1", (sport,)).fetchone():
+        raise SegmentError(400, "Select an existing sport.")
+    radius = payload.get("radius_m", 30)
+    if isinstance(radius, bool) or not isinstance(radius, (int, float)) or not math.isfinite(radius) or not 5 <= radius <= 500:
+        raise SegmentError(400, "GPS tolerance must be between 5 and 500 metres.")
+    points = payload.get("checkpoints")
+    if not isinstance(points, list) or not 1 <= len(points) <= 100:
+        raise SegmentError(400, "Place between 1 and 100 checkpoints.")
+    for point in points:
+        if (not isinstance(point, list) or len(point) != 2 or
+            any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in point) or
+            not -85 <= point[0] <= 85 or not -180 <= point[1] <= 180):
+            raise SegmentError(400, "Checkpoints must contain valid latitude and longitude coordinates (latitude within ±85°).")
+    if any(a == b for a, b in zip(points, points[1:])):
+        raise SegmentError(400, "Adjacent checkpoints must be different.")
+    return name.strip(), sport, radius, points
+
+
+def traversal_geometry(db, traversal):
+    start, end = traversal["start_pos"], traversal["end_pos"]
+    rows = db.execute("SELECT seq,lat,lon FROM track_points WHERE activity_id=? AND seq BETWEEN ? AND ? ORDER BY seq",
+                      (traversal["activity_id"], math.floor(start), math.ceil(end))).fetchall()
+    by_seq = {r["seq"]: r for r in rows}
+
+    def at(position):
+        a, b = by_seq.get(math.floor(position)), by_seq.get(math.ceil(position))
+        if a is None or b is None:
+            raise SegmentError(409, "Track data changed; wait for segment matching to finish.")
+        fraction = position - math.floor(position)
+        return [a["lat"] + fraction * (b["lat"] - a["lat"]), a["lon"] + fraction * (b["lon"] - a["lon"])]
+
+    return [at(start)] + [[r["lat"], r["lon"]] for r in rows if start < r["seq"] < end] + ([at(end)] if end != start else [])
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT / "web"), **kwargs)
 
     def do_GET(self):
+        if urlsplit(self.path).path.startswith("/api/segments"):
+            return self.segment_request("GET")
         if self.path.startswith("/api/activities"):
             with connect() as db:
                 rows = [dict(r) for r in db.execute("SELECT id,start_time,sport,duration_s,distance_m, EXISTS(SELECT 1 FROM track_points p WHERE p.activity_id=activities.id) AS has_track FROM activities ORDER BY start_time DESC")]
@@ -378,9 +625,132 @@ class Handler(SimpleHTTPRequestHandler):
             self.path = "/index.html"
         return super().do_GET()
 
-    def send_json(self, obj):
+    def do_POST(self):
+        self.segment_request("POST")
+
+    def do_PUT(self):
+        self.segment_request("PUT")
+
+    def do_DELETE(self):
+        self.segment_request("DELETE")
+
+    def segment_request(self, method):
+        try:
+            parsed = urlsplit(self.path)
+            parts = parsed.path.strip("/").split("/")
+            if parts[:2] != ["api", "segments"]:
+                raise SegmentError(404, "API endpoint not found.")
+            payload = {}
+            if method != "GET":
+                # Browser mutations must originate from this local application.
+                host = self.headers.get("Host", "")
+                allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+                origin = self.headers.get("Origin")
+                if (host not in allowed or self.headers.get("Sec-Fetch-Site") == "cross-site" or
+                    (origin is not None and origin != f"http://{host}")):
+                    raise SegmentError(403, "Only same-origin requests are allowed.")
+                if self.headers.get_content_type() != "application/json":
+                    raise SegmentError(415, "Send an application/json request.")
+                try:
+                    size = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < size <= 65536:
+                        raise ValueError()
+                    payload = json.loads(self.rfile.read(size))
+                except (ValueError, UnicodeDecodeError):
+                    raise SegmentError(400, "Invalid JSON request (maximum 64 KB).")
+                if not isinstance(payload, dict):
+                    raise SegmentError(400, "Expected a JSON object.")
+            with closing(connect()) as db:
+                if len(parts) == 2:
+                    if method == "GET":
+                        return self.send_json([segment_detail(db, r[0]) for r in db.execute("SELECT id FROM segments ORDER BY name,id").fetchall()])
+                    if method != "POST":
+                        raise SegmentError(405, "Method not allowed.")
+                    name, sport, radius, points = validate_segment(db, payload)
+                    with db:
+                        sid = db.execute("INSERT INTO segments(name,sport,radius_m) VALUES(?,?,?)", (name, sport, radius)).lastrowid
+                        db.executemany("INSERT INTO segment_checkpoints VALUES(?,?,?,?)",
+                                       [(sid, index, *point) for index, point in enumerate(points)])
+                    return self.send_json(segment_detail(db, sid), 201)
+                try:
+                    sid = int(parts[2])
+                except (ValueError, IndexError):
+                    raise SegmentError(404, "Segment not found.")
+                segment = segment_detail(db, sid)
+                if len(parts) == 3:
+                    if method == "GET":
+                        return self.send_json(segment)
+                    if method not in {"PUT", "DELETE"}:
+                        raise SegmentError(405, "Method not allowed.")
+                    db.execute("BEGIN IMMEDIATE")
+                    segment = segment_detail(db, sid)
+                    if payload.get("revision") != segment["revision"]:
+                        raise SegmentError(409, "This segment changed. Cancel editing and reopen it.")
+                    if method == "DELETE":
+                        db.execute("DELETE FROM segments WHERE id=?", (sid,))
+                        db.commit()
+                        return self.send_json({"deleted": True})
+                    name, sport, radius, points = validate_segment(db, payload)
+                    changed = sport != segment["sport"] or radius != segment["radius_m"] or points != segment["checkpoints"]
+                    # Any edit increments the revision to detect concurrent editors.
+                    status = "pending" if changed or segment["status"] == "failed" else segment["status"]
+                    if status == "processing":
+                        status = "pending"
+                    db.execute("""UPDATE segments SET name=?,sport=?,radius_m=?,revision=revision+1,status=?,
+                        error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""", (name, sport, radius, status, sid))
+                    db.execute("DELETE FROM segment_checkpoints WHERE segment_id=?", (sid,))
+                    db.executemany("INSERT INTO segment_checkpoints VALUES(?,?,?,?)",
+                                   [(sid, index, *point) for index, point in enumerate(points)])
+                    if status == "pending":
+                        db.execute("DELETE FROM segment_traversals WHERE segment_id=?", (sid,))
+                        db.execute("UPDATE segments SET progress_done=0,progress_total=0 WHERE id=?", (sid,))
+                    db.commit()
+                    return self.send_json(segment_detail(db, sid))
+                if method != "GET":
+                    raise SegmentError(405, "Method not allowed.")
+                if segment["status"] != "completed":
+                    raise SegmentError(409, "Segment results are not ready yet.")
+                if parts[3:] == ["routes"]:
+                    routes = []
+                    for activity in db.execute("SELECT DISTINCT activity_id FROM segment_traversals WHERE segment_id=?", (sid,)).fetchall():
+                        records = db.execute("SELECT lat,lon,timestamp FROM track_points WHERE activity_id=? ORDER BY seq", (activity[0],)).fetchall()
+                        routes.append({"activity_id": activity[0], "segments": display_segments(records, max(1, len(records) // 500))})
+                    return self.send_json(routes)
+                if parts[3:] == ["traversals"]:
+                    query = parse_qs(parsed.query)
+                    try:
+                        offset = max(0, int(query.get("offset", ["0"])[0]))
+                        limit = min(100, max(1, int(query.get("limit", ["50"])[0])))
+                    except ValueError:
+                        raise SegmentError(400, "Invalid pagination.")
+                    rows = db.execute("""SELECT t.*,a.start_time AS activity_start_time,a.sport FROM segment_traversals t
+                        JOIN activities a ON a.id=t.activity_id WHERE t.segment_id=?
+                        ORDER BY t.duration_s IS NULL,t.duration_s,a.start_time DESC,t.id LIMIT ? OFFSET ?""", (sid, limit, offset))
+                    return self.send_json({"items": [dict(r) for r in rows], "total": segment["traversal_count"], "offset": offset, "limit": limit})
+                if len(parts) == 6 and parts[3] == "traversals" and parts[5] == "geometry":
+                    try:
+                        tid = int(parts[4])
+                    except ValueError:
+                        raise SegmentError(404, "Traversal not found.")
+                    traversal = db.execute("SELECT * FROM segment_traversals WHERE id=? AND segment_id=?", (tid, sid)).fetchone()
+                    if traversal is None:
+                        raise SegmentError(404, "Traversal not found.")
+                    return self.send_json({"activity_id": traversal["activity_id"], "points": traversal_geometry(db, traversal)})
+                raise SegmentError(404, "API endpoint not found.")
+        except SegmentError as exc:
+            self.send_json({"error": exc.message}, exc.status)
+        except Exception:
+            LOG.exception("Segment API request failed")
+            self.send_json({"error": "The request could not be completed. Please retry."}, 500)
+
+    def send_json(self, obj, status=200):
         data = json.dumps(obj).encode()
-        self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(data))); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(data)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
 
 def main():
@@ -401,8 +771,21 @@ def main():
     elif args.command == "export-map": export_map()
     else:
         if not DB_PATH.exists(): import_all()
+        with closing(connect()) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+        stop = threading.Event()
+        worker = threading.Thread(target=segment_worker, args=(stop,), daemon=True, name="segment-matcher")
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        worker.start()
         print(f"Open http://127.0.0.1:{args.port}")
-        ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+            server.server_close()
+            worker.join(timeout=5)
 
 
 if __name__ == "__main__":
