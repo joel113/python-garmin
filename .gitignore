@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+activities.sqlite3
+activities.sqlite3-shm
+activities.sqlite3-wal
