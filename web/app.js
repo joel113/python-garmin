@@ -45,6 +45,98 @@ function summary() {
   }
   $("#sport-filter").replaceChildren(new Option("All sports","all"));
   [...sports.keys()].sort().forEach(key=>$("#sport-filter").add(new Option(sportName(key),key)));
+  $("#compare-sport").replaceChildren(new Option("All sports","all"));
+  [...sports.keys()].sort().forEach(key=>$("#compare-sport").add(new Option(sportName(key),key)));
+  populateComparisonPeriods();
+}
+// Use the recorded calendar date consistently for FIT and GPX timestamps.
+// UTC arithmetic avoids browser timezone shifts and daylight-saving changes.
+function comparisonDate(value) {
+  const match=/^(\d{4})-(\d{2})-(\d{2})/.exec(value || "");
+  if (!match) return null;
+  const [year,month,day]=match.slice(1).map(Number);
+  const result=new Date(Date.UTC(year,month-1,day));
+  return result.getUTCFullYear()===year && result.getUTCMonth()===month-1 && result.getUTCDate()===day ? result : null;
+}
+function periodStart(date,unit) {
+  const result=new Date(date);
+  if (unit==="year") return new Date(Date.UTC(result.getUTCFullYear(),0,1));
+  if (unit==="month") return new Date(Date.UTC(result.getUTCFullYear(),result.getUTCMonth(),1));
+  result.setUTCDate(result.getUTCDate()-(result.getUTCDay()+6)%7);
+  return result;
+}
+function nextPeriod(date,unit) {
+  const result=new Date(date);
+  if (unit==="year") result.setUTCFullYear(result.getUTCFullYear()+1);
+  else if (unit==="month") result.setUTCMonth(result.getUTCMonth()+1);
+  else result.setUTCDate(result.getUTCDate()+7);
+  return result;
+}
+function periodLabel(start,unit) {
+  if (unit==="year") return String(start.getUTCFullYear());
+  if (unit==="month") return start.toLocaleDateString(undefined,{month:"long",year:"numeric",timeZone:"UTC"});
+  const thursday=new Date(start); thursday.setUTCDate(thursday.getUTCDate()+3);
+  const year=thursday.getUTCFullYear();
+  const firstMonday=periodStart(new Date(Date.UTC(year,0,4)),"week");
+  const week=1+Math.round((start-firstMonday)/604800000);
+  const end=new Date(start); end.setUTCDate(end.getUTCDate()+6);
+  const format=d=>d.toLocaleDateString(undefined,{month:"short",day:"numeric",timeZone:"UTC"});
+  return year+" · Week "+String(week).padStart(2,"0")+" ("+format(start)+" – "+format(end)+")";
+}
+function populateComparisonPeriods() {
+  const unit=$("#compare-unit").value;
+  const dates=activities.map(a=>comparisonDate(a.start_time)).filter(Boolean).sort((a,b)=>a-b);
+  const selects=[$("#compare-a"),$("#compare-b")];
+  selects.forEach(select=>{select.replaceChildren(); select.disabled=!dates.length;});
+  if (dates.length) {
+    // Include the preceding period even when the archive contains just one.
+    let first=periodStart(dates[0],unit);
+    const last=periodStart(dates.at(-1),unit);
+    if (+first===+last) {
+      first=new Date(first);
+      if (unit==="year") first.setUTCFullYear(first.getUTCFullYear()-1);
+      else if (unit==="month") first.setUTCMonth(first.getUTCMonth()-1);
+      else first.setUTCDate(first.getUTCDate()-7);
+    }
+    const periods=[];
+    for (let cursor=first;cursor<=last;cursor=nextPeriod(cursor,unit)) periods.push(cursor);
+    periods.reverse().forEach(start=>selects.forEach(select=>select.add(new Option(periodLabel(start,unit),start.toISOString().slice(0,10)))));
+    selects[1].selectedIndex=Math.min(1,selects[1].options.length-1);
+  }
+  renderComparison();
+}
+function renderComparison() {
+  const unit=$("#compare-unit").value, sport=$("#compare-sport").value;
+  const keys=[$("#compare-a").value,$("#compare-b").value];
+  if (!keys[0] || !keys[1]) {
+    $("#comparison-results").textContent="No dated activities available to compare.";
+    $("#comparison-note").textContent="";
+    return;
+  }
+  const totals=keys.map(()=>({count:0,distance:0,duration:0}));
+  let undated=0;
+  for (const activity of activities) {
+    if (sport!=="all" && (activity.sport || "Unspecified")!==sport) continue;
+    const date=comparisonDate(activity.start_time);
+    if (!date) { undated++; continue; }
+    const key=periodStart(date,unit).toISOString().slice(0,10);
+    keys.forEach((selected,index)=>{
+      if (key!==selected) return;
+      totals[index].count++; totals[index].distance+=number(activity.distance_m); totals[index].duration+=number(activity.duration_s);
+    });
+  }
+  const metrics=[["Activities","count",value=>value.toLocaleString()],["Distance","distance",km],["Recorded time","duration",hours]];
+  const labels=[$("#compare-a").selectedOptions[0].text,$("#compare-b").selectedOptions[0].text];
+  let html='<table class="comparison-table"><caption class="small">Period A compared with period B</caption><thead><tr><th scope="col">Metric</th><th scope="col">A · '+escape(labels[0])+'</th><th scope="col">B · '+escape(labels[1])+'</th><th scope="col">Change A vs B</th></tr></thead><tbody>';
+  for (const [label,key,format] of metrics) {
+    const a=totals[0][key],b=totals[1][key],max=Math.max(a,b);
+    const delta=a-b;
+    const percent=b ? " ("+(delta>0?"+":"")+(100*delta/b).toLocaleString(undefined,{maximumFractionDigits:1})+"%)" : (a ? " (no baseline)" : "");
+    const change=(delta>0?"+":delta<0?"−":"")+format(Math.abs(delta))+percent;
+    html+='<tr><th scope="row">'+label+'</th>'+[a,b].map((value,index)=>'<td><strong>'+format(value)+'</strong><div class="compare-bar"><span class="period-'+index+'" style="width:'+(max?100*value/max:0)+'%"></span></div></td>').join("")+'<td>'+escape(change)+'</td></tr>';
+  }
+  $("#comparison-results").innerHTML=html+"</tbody></table>";
+  $("#comparison-note").textContent="Weeks run Monday–Sunday (ISO week numbers). Totals use recorded calendar dates; ongoing or partially imported periods may be incomplete. Missing distance or duration contributes zero."+ (undated ? " "+undated+" activities without a valid date are excluded." : "");
 }
 function renderList() {
   const query=$("#search").value.toLowerCase();
@@ -127,4 +219,6 @@ document.querySelectorAll("[data-view]").forEach(button=>button.onclick=()=>swit
 $("#sport-filter").onchange=showHeat; $("#search").oninput=renderList;
 $("#heat-mode").onchange=updateHeatStyle;
 $("#heat-color").oninput=updateHeatStyle;
+$("#compare-unit").onchange=populateComparisonPeriods;
+["#compare-sport","#compare-a","#compare-b"].forEach(selector=>$(selector).onchange=renderComparison);
 getJSON("/api/activities").then(data=>{activities=data; summary(); renderList();}).catch(error=>{ $("#date-range").textContent="Activity data could not be loaded. Restart the server and refresh."; report(error); });

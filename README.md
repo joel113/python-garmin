@@ -50,6 +50,8 @@ uv run python app.py serve --port 9000
 
 The map uses Leaflet and OpenStreetMap tiles and therefore needs an internet connection to display the base map. The application server listens on localhost.
 
+In Summary, **Compare periods** lets you choose two years, months, or weeks and optionally filter by sport. It compares activity count, distance, and recorded time with bars, absolute changes, and percentage changes relative to period B. Weeks use ISO week numbers and run Monday–Sunday. Periods without activities show zero; missing dates are excluded. Ongoing periods and partially imported history may be incomplete.
+
 In the heatmap, choose **Overlapping routes** for the density view or **Individual tracks** for more visible routes that highlight on hover. Click a route to open its full track in Single tracks. The route color picker updates either heatmap mode immediately.
 
 The heatmap uses an approximate budget of 800,000 coordinates across the selected sports, with reduced map simplification to preserve curves when zooming in. Larger selections can take longer to load; single tracks use all stored coordinates.
