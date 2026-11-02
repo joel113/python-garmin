@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Garmin Activity Library</title><link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"><link rel="stylesheet" href="/style.css"></head>
-<body><nav class="sidebar" aria-label="Main navigation"><div class="brand">Garmin<span>Activity Library</span></div><button data-view="summary" aria-current="page">Summary</button><button data-view="heat">Heatmap</button><button data-view="tracks">Tracks</button><button data-view="segments">Segments</button></nav>
+<body><nav class="sidebar" aria-label="Main navigation"><div class="brand">Garmin<span>Activity Library</span></div><button data-view="summary" aria-current="page">Summary</button><button data-view="heat">Heatmap</button><button data-view="tracks">Tracks</button><button data-view="segments">Segments</button><button data-view="destinations">Destinations</button></nav>
 <main><p id="error" role="alert" hidden></p>
 <section id="summary" class="view"><header><h1>Summary</h1><p id="date-range" class="muted">Loading activities…</p></header><div id="cards" class="cards"></div>
 <article class="panel comparison"><h2>Compare periods</h2>
@@ -26,4 +26,20 @@
 <div id="segment-detail" hidden><h2 id="segment-title"></h2><p id="segment-info" class="small"></p><div class="segment-actions"><button id="segment-edit">Edit</button><button id="segment-delete" class="danger">Delete</button></div><div id="segment-stats"></div><p class="small">Select a traversal to highlight its path. Open activity to see its full track.</p><div id="segment-traversals"></div><div class="segment-actions"><button id="segment-prev">Previous</button><span id="segment-page" class="small"></span><button id="segment-next">Next</button></div></div>
 </aside><div id="segment-map" class="map" aria-label="Segment checkpoints and matching activities"></div></div>
 </section>
-</main><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="/app.js?v=segment-visibility-3" defer></script><script src="/segments.js?v=segment-visibility-3" defer></script></body></html>
+<section id="destinations" class="view map-view" hidden>
+<header><div><h1>Destinations</h1><p class="muted">Discover the places your trips return to most.</p></div><label>Sport<select id="destination-sport"><option value="all">All sports</option></select></label></header>
+<p id="destination-status" class="status" role="status">Loading destinations…</p>
+<div class="destination-layout"><aside class="destination-sidebar">
+<details class="destination-settings"><summary>Clustering settings</summary><form id="destination-settings-form">
+<label>Neighborhood distance (metres)<input id="destination-epsilon" type="number" min="10" max="1000" step="any" value="75" required></label>
+<label>Minimum distinct trips<input id="destination-min-trips" type="number" min="2" max="100" value="3" required></label>
+<p class="small">Nearby endpoints form shared places. DBSCAN can connect chains of neighbors; this distance is not a maximum destination size. Changing these settings can merge or split places.</p>
+<button class="primary" type="submit">Recluster destinations</button></form></details>
+<p id="destination-count" class="small"></p><div id="destination-list"></div>
+<section id="destination-detail" hidden><h2 id="destination-title"></h2><p id="destination-id" class="small"></p>
+<form id="destination-name-form"><label>Custom name<input id="destination-name" maxlength="120" placeholder="Home, Office, …"></label><button type="submit">Save name</button></form>
+<p id="destination-summary" class="small"></p><h3>Associated trips</h3><div id="destination-activities"></div>
+<div class="segment-actions"><button id="destination-prev">Previous</button><span id="destination-page" class="small"></span><button id="destination-next">Next</button></div></section>
+</aside><div class="destination-map-area"><p class="small">Ranked by distinct trips · a round trip counts once · green dots are departures, orange dots are arrivals</p><div id="destination-map" class="map" aria-label="Destinations and trip endpoints"></div></div></div>
+</section>
+</main><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script src="/app.js?v=destinations-1" defer></script><script src="/segments.js?v=segment-visibility-3" defer></script><script src="/destinations.js?v=1" defer></script></body></html>

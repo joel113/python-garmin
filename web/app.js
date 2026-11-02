@@ -60,6 +60,7 @@ function summary() {
   [...sports.keys()].sort().forEach(key=>$("#compare-sport").add(new Option(sportName(key),key)));
   populateComparisonPeriods();
   if (window.segmentUI) window.segmentUI.setSports();
+  if (window.destinationUI) window.destinationUI.setSports();
 }
 // Use the recorded calendar date consistently for FIT and GPX timestamps.
 // UTC arithmetic avoids browser timezone shifts and daylight-saving changes.
@@ -359,6 +360,7 @@ async function showHeat() {
 }
 function switchView(view) {
   if (window.segmentUI && !window.segmentUI.allowNavigate(view)) return false;
+  if(window.destinationUI && view!=="destinations") window.destinationUI.hide();
   clearTimeout(trackSegmentPoll);
   document.querySelectorAll(".view").forEach(section=>section.hidden=section.id!==view);
   document.querySelectorAll("[data-view]").forEach(button=>{if(button.dataset.view===view) button.setAttribute("aria-current","page"); else button.removeAttribute("aria-current");});
@@ -366,6 +368,7 @@ function switchView(view) {
     try {
       if (view==="heat") showHeat();
       if (view==="segments") window.segmentUI.show();
+      if (view==="destinations") window.destinationUI.show();
       if (view==="tracks") {
         getMap("map");
         if (!selected) { const first=activities.find(a=>a.has_track); if (first) showTrack(first.id); }

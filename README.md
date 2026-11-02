@@ -1,6 +1,6 @@
 # Garmin Activity Library
 
-This project stores Garmin FIT and GPX activities locally, indexes activity metadata and GPS points in SQLite, and provides a searchable web map. Source files remain in `activities/`. Imported activity data can be recreated from them; saved segment definitions are user-created data and require a database backup.
+This project stores Garmin FIT and GPX activities locally, indexes activity metadata and GPS points in SQLite, and provides a searchable web map. Source files remain in `activities/`. Imported activity data can be recreated from them; saved segment definitions and destination identities/custom names require a database backup.
 
 ## Setup
 
@@ -42,7 +42,7 @@ The fetch command saves supported FIT or GPX files to `activities/` and imports 
 uv run python app.py serve
 ```
 
-Open <http://127.0.0.1:8000>. Use the left navigation to switch between Summary, Heatmap, Tracks, and Segments. The summary shows totals, GPS coverage, sports, and recent activities. The heatmap draws all routes on a map with a sport filter; overlapping paths show frequently visited routes. Route coordinates are sampled for responsiveness. Tracks shows an activity list alongside its map and identifies activities without GPS. To choose another port, for example `9000`:
+Open <http://127.0.0.1:8000>. Use the left navigation to switch between Summary, Heatmap, Tracks, Segments, and Destinations. The summary shows totals, GPS coverage, sports, and recent activities. The heatmap draws all routes on a map with a sport filter; overlapping paths show frequently visited routes. Route coordinates are sampled for responsiveness. Tracks shows an activity list alongside its map and identifies activities without GPS. To choose another port, for example `9000`:
 
 ```bash
 uv run python app.py serve --port 9000
@@ -81,6 +81,20 @@ uv run python -c 'import sqlite3; source=sqlite3.connect("activities.sqlite3"); 
 ```
 
 To restore, stop the application, use SQLite's backup API from the backup file into the destination database, and restart the app. Keep backups private and outside Git.
+
+## Destinations
+
+Open **Destinations** to discover frequently visited places from trip start and end locations. The map and ranked list use distinct trips: a round trip counts once toward popularity but adds both a departure and an arrival. Select a place to see its centroid, member endpoints, and paginated trip list. Clicking a trip or endpoint opens Tracks. Green dots indicate departures and orange dots indicate arrivals.
+
+Clustering uses scikit-learn DBSCAN with haversine distance on coordinates in radians. The defaults are a **75 m neighborhood distance** and **three distinct trips**. DBSCAN uses three endpoint samples as its density minimum, followed by a distinct-trip check; isolated stops and clusters with too few trips remain unassigned. Exact duplicate coordinates use sample weights to reduce memory without changing density semantics. Neighbor chains can connect areas larger than the configured distance.
+
+Under **Clustering settings**, adjust the neighborhood distance (10–1000 m) and minimum distinct trips (2–100), then choose **Recluster destinations**. All sports, including GPX, contribute to shared places. The sport filter changes displayed counts and associated trips without changing the clusters or their identities.
+
+First startup prepares endpoints from existing activities in the background. Endpoint extraction ignores pre-activity timestamps, invalid coordinates, isolated GPS points, and existing GPS discontinuities. Trips without a usable continuous track are excluded. Imports, replacements, and deletions automatically queue processing after a short quiet period. The UI shows progress, preserves previous results while updating, and refreshes automatically. If processing fails, use Recluster destinations to retry. Processing requires the app server to be running.
+
+New places receive a coordinate-based ID such as `dest_48.1672_11.5354`, rounded to four decimal places (about 11 m of latitude). The full-precision spherical centroid is stored separately and can move while the ID stays fixed. Updates match old and new clusters by shared endpoints first and proximity second. The largest matching child retains an ID after a split; a merge retains the strongest overlapping identity. Coordinate collisions receive a deterministic suffix. Retired IDs are not recycled.
+
+You can save an optional custom name such as Home or Office. Clearing the name returns to displaying the geographic ID. Names survive normal reclustering. Retired destinations and names remain in the database but do not appear in the active list. Back up the SQLite database to preserve names and identity history; source FIT/GPX files alone cannot reconstruct them. No reverse-geocoding service or Garmin request is used for destination discovery.
 
 ## Run with Docker Compose
 
@@ -196,6 +210,6 @@ These commands write `analysis/activities.csv` and `analysis/activities_map.html
 ## Data and secrets
 
 - `activities/` contains source FIT and GPX files.
-- The configured SQLite database contains the searchable activity index, track points, saved segment definitions, and cached traversals. The default `activities.sqlite3` and Docker's `storage/` folder are ignored by Git and should be backed up. Ignore custom database locations too if they are inside the repository.
+- The configured SQLite database contains the searchable activity index, track points, saved segment definitions, cached traversals, and destination identities, names, and endpoint memberships. The default `activities.sqlite3` and Docker's `storage/` folder are ignored by Git and should be backed up. Ignore custom database locations too if they are inside the repository.
 - `GARMIN_API_KEY` should be kept private and is never written by the application.
 - `.env` is loaded automatically and is ignored by Git.

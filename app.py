@@ -14,6 +14,7 @@ import time
 import math
 import threading
 import signal
+import hashlib
 from contextlib import closing
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -96,6 +97,47 @@ def connect():
         activity_id TEXT PRIMARY KEY REFERENCES activities(id) ON DELETE CASCADE,
         min_lat REAL, max_lat REAL, min_lon REAL, max_lon REAL
       );
+      CREATE TABLE IF NOT EXISTS destination_state (
+        id INTEGER PRIMARY KEY CHECK(id=1), epsilon_m REAL NOT NULL DEFAULT 75,
+        min_trips INTEGER NOT NULL DEFAULT 3, revision INTEGER NOT NULL DEFAULT 1,
+        published_revision INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+        phase TEXT NOT NULL DEFAULT 'endpoints', error TEXT, progress_done INTEGER NOT NULL DEFAULT 0,
+        progress_total INTEGER NOT NULL DEFAULT 0, changed_at REAL NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO destination_state(id) VALUES(1);
+      CREATE TABLE IF NOT EXISTS activity_endpoints (
+        activity_id TEXT NOT NULL REFERENCES activities(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK(role IN ('start','end')), lat REAL NOT NULL, lon REAL NOT NULL,
+        recorded_at TEXT, PRIMARY KEY(activity_id,role)
+      );
+      CREATE TABLE IF NOT EXISTS destination_endpoint_sources (
+        activity_id TEXT PRIMARY KEY REFERENCES activities(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS destinations (
+        id TEXT PRIMARY KEY, name TEXT, seed_lat REAL NOT NULL, seed_lon REAL NOT NULL,
+        centroid_lat REAL NOT NULL, centroid_lon REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS destination_memberships (
+        activity_id TEXT NOT NULL, role TEXT NOT NULL, destination_id TEXT NOT NULL REFERENCES destinations(id),
+        PRIMARY KEY(activity_id,role),
+        FOREIGN KEY(activity_id,role) REFERENCES activity_endpoints(activity_id,role) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS destination_membership_idx ON destination_memberships(destination_id,activity_id);
+      CREATE TRIGGER IF NOT EXISTS destinations_activity_insert AFTER INSERT ON activities BEGIN
+        UPDATE destination_state SET revision=revision+1,status='pending',error=NULL,
+          changed_at=CAST(strftime('%s','now') AS REAL) WHERE id=1;
+      END;
+      CREATE TRIGGER IF NOT EXISTS destinations_activity_delete AFTER DELETE ON activities BEGIN
+        UPDATE destination_state SET revision=revision+1,status='pending',error=NULL,
+          changed_at=CAST(strftime('%s','now') AS REAL) WHERE id=1;
+      END;
+      CREATE TRIGGER IF NOT EXISTS destinations_activity_update AFTER UPDATE OF start_time,sport ON activities BEGIN
+        DELETE FROM activity_endpoints WHERE activity_id=NEW.id;
+        DELETE FROM destination_endpoint_sources WHERE activity_id=NEW.id;
+        UPDATE destination_state SET revision=revision+1,status='pending',error=NULL,
+          changed_at=CAST(strftime('%s','now') AS REAL) WHERE id=1;
+      END;
     """)
     db.execute("PRAGMA foreign_keys = ON")
     return db
@@ -589,6 +631,217 @@ def traversal_geometry(db, traversal):
     return [at(start)] + [[r["lat"], r["lon"]] for r in rows if start < r["seq"] < end] + ([at(end)] if end != start else [])
 
 
+def extract_trip_endpoints(rows, start_time):
+    """First/last points of usable continuous blocks, ignoring pre-activity data."""
+    activity_start = point_time(start_time)
+    first, last, block_start, previous, count = None, None, None, None, 0
+
+    def finish():
+        nonlocal first, last
+        if count >= 2:
+            if first is None:
+                first = block_start
+            last = previous
+
+    for row in rows:
+        lat, lon = row["lat"], row["lon"]
+        if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+            continue
+        seconds = point_time(row["timestamp"])
+        if activity_start is not None and seconds is not None and seconds < activity_start:
+            continue
+        current = (lat, lon, seconds)
+        if previous is not None and gps_discontinuity(previous, current):
+            finish()
+            count = 0
+        if count == 0:
+            block_start = current
+        previous = current
+        count += 1
+    finish()
+    if first is None:
+        return []
+    return [(role, p[0], p[1], iso_time(p[2] if p[2] is not None else activity_start))
+            for role, p in (("start", first), ("end", last))]
+
+
+def cluster_destination_endpoints(endpoints, epsilon_m, min_trips):
+    import numpy as np
+    from sklearn.cluster import DBSCAN
+
+    if not endpoints:
+        return []
+    endpoints = sorted(endpoints, key=lambda p: (p["lat"], p["lon"], p["activity_id"], p["role"]))
+    coordinates = np.radians([[p["lat"], p["lon"]] for p in endpoints])
+    # Exact duplicates share a weighted sample, preserving DBSCAN density semantics.
+    unique, inverse, weights = np.unique(coordinates, axis=0, return_inverse=True, return_counts=True)
+    labels = DBSCAN(eps=epsilon_m / 6_371_000, min_samples=min_trips,
+                    metric="haversine", algorithm="ball_tree", n_jobs=1).fit_predict(unique, sample_weight=weights)[inverse]
+    groups = {}
+    for point, label in zip(endpoints, labels):
+        if label >= 0:
+            groups.setdefault(int(label), []).append(point)
+    clusters = []
+    for members in groups.values():
+        if len({p["activity_id"] for p in members}) < min_trips:
+            continue
+        radians = np.radians([[p["lat"], p["lon"]] for p in members])
+        lat, lon = radians[:, 0], radians[:, 1]
+        x, y, z = np.mean(np.cos(lat) * np.cos(lon)), np.mean(np.cos(lat) * np.sin(lon)), np.mean(np.sin(lat))
+        centroid = (math.degrees(math.atan2(z, math.hypot(x, y))), math.degrees(math.atan2(y, x)))
+        clusters.append({"centroid": centroid, "members": {(p["activity_id"], p["role"]) for p in members}})
+    return sorted(clusters, key=lambda c: (*c["centroid"], sorted(c["members"])))
+
+
+def assign_destination_ids(clusters, previous, memberships, reserved, epsilon_m):
+    """Reuse identities by overlap, then proximity; never recycle retired IDs."""
+    assigned, used_old = {}, set()
+    pairs = []
+    for index, cluster in enumerate(clusters):
+        for old in previous:
+            old_members = memberships.get(old["id"], set())
+            common = len(cluster["members"] & old_members)
+            if common:
+                jaccard = common / len(cluster["members"] | old_members)
+                pairs.append((-common, -jaccard, old["id"], index))
+    for _, _, old_id, index in sorted(pairs):
+        if index not in assigned and old_id not in used_old:
+            assigned[index] = old_id
+            used_old.add(old_id)
+    nearby = []
+    for index, cluster in enumerate(clusters):
+        if index in assigned:
+            continue
+        for old in previous:
+            if old["id"] in used_old:
+                continue
+            distance = distance_between(cluster["centroid"], (old["centroid_lat"], old["centroid_lon"]))
+            if distance <= epsilon_m:
+                nearby.append((distance, old["id"], index))
+    for _, old_id, index in sorted(nearby):
+        if index not in assigned and old_id not in used_old:
+            assigned[index] = old_id
+            used_old.add(old_id)
+    reserved = set(reserved)
+    for index, cluster in enumerate(clusters):
+        if index in assigned:
+            cluster["id"] = assigned[index]
+            continue
+        lat, lon = cluster["centroid"]
+        lat, lon = (0 if abs(v) < 0.00005 else v for v in (lat, lon))
+        base = f"dest_{lat:.4f}_{lon:.4f}"
+        candidate = base
+        suffix = hashlib.sha256(json.dumps(sorted(cluster["members"])).encode()).hexdigest()[:8]
+        collision = 1
+        while candidate in reserved:
+            candidate = f"{base}_{suffix}" + (f"_{collision}" if collision > 1 else "")
+            collision += 1
+        cluster["id"] = candidate
+        reserved.add(candidate)
+    return clusters
+
+
+def backfill_destination_endpoints(db, revision, stop):
+    missing = db.execute("""SELECT id,start_time FROM activities
+        WHERE id NOT IN (SELECT activity_id FROM destination_endpoint_sources) ORDER BY id""").fetchall()
+    db.execute("UPDATE destination_state SET phase='endpoints',progress_done=0,progress_total=? WHERE id=1 AND revision=?", (len(missing), revision))
+    db.commit()
+    for done, activity in enumerate(missing, 1):
+        if stop.is_set():
+            return False
+        points = db.execute("SELECT lat,lon,timestamp FROM track_points WHERE activity_id=? ORDER BY seq", (activity["id"],)).fetchall()
+        endpoints = extract_trip_endpoints(points, activity["start_time"])
+        db.execute("BEGIN IMMEDIATE")
+        if db.execute("SELECT revision FROM destination_state WHERE id=1").fetchone()[0] != revision:
+            db.rollback()
+            return False
+        db.execute("DELETE FROM activity_endpoints WHERE activity_id=?", (activity["id"],))
+        db.executemany("INSERT INTO activity_endpoints VALUES(?,?,?,?,?)", [(activity["id"], *p) for p in endpoints])
+        db.execute("INSERT OR IGNORE INTO destination_endpoint_sources VALUES(?)", (activity["id"],))
+        db.execute("UPDATE destination_state SET progress_done=? WHERE id=1 AND revision=?", (done, revision))
+        db.commit()
+    return True
+
+
+def destination_worker(stop):
+    try:
+        with closing(connect()) as db:
+            db.execute("UPDATE destination_state SET status='pending' WHERE status='processing'")
+            db.commit()
+    except Exception:
+        LOG.exception("Could not initialize destination processing")
+        return
+    while not stop.is_set():
+        revision = None
+        try:
+            with closing(connect()) as db:
+                state = db.execute("SELECT * FROM destination_state WHERE id=1").fetchone()
+                if state["status"] != "pending" or time.time() - state["changed_at"] < 2:
+                    stop.wait(1)
+                    continue
+                revision = state["revision"]
+                db.execute("UPDATE destination_state SET status='processing',error=NULL WHERE id=1 AND revision=?", (revision,))
+                db.commit()
+                if not backfill_destination_endpoints(db, revision, stop):
+                    continue
+                db.execute("UPDATE destination_state SET phase='clustering' WHERE id=1 AND revision=?", (revision,))
+                db.commit()
+                db.execute("BEGIN")
+                endpoints = [dict(r) for r in db.execute("SELECT * FROM activity_endpoints ORDER BY activity_id,role")]
+                previous = [dict(r) for r in db.execute("SELECT * FROM destinations WHERE active=1 ORDER BY id")]
+                reserved = {r[0] for r in db.execute("SELECT id FROM destinations")}
+                memberships = {}
+                for row in db.execute("SELECT * FROM destination_memberships"):
+                    memberships.setdefault(row["destination_id"], set()).add((row["activity_id"], row["role"]))
+                db.commit()
+                clusters = cluster_destination_endpoints(endpoints, state["epsilon_m"], state["min_trips"])
+                assign_destination_ids(clusters, previous, memberships, reserved, state["epsilon_m"])
+                if stop.is_set():
+                    continue
+                db.execute("BEGIN IMMEDIATE")
+                if db.execute("SELECT revision FROM destination_state WHERE id=1").fetchone()[0] != revision:
+                    db.rollback()
+                    continue
+                db.execute("DELETE FROM destination_memberships")
+                db.execute("UPDATE destinations SET active=0")
+                for cluster in clusters:
+                    lat, lon = cluster["centroid"]
+                    db.execute("""INSERT INTO destinations(id,seed_lat,seed_lon,centroid_lat,centroid_lon)
+                        VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                        centroid_lat=excluded.centroid_lat,centroid_lon=excluded.centroid_lon,
+                        active=1,updated_at=CURRENT_TIMESTAMP""", (cluster["id"], lat, lon, lat, lon))
+                    db.executemany("INSERT INTO destination_memberships VALUES(?,?,?)",
+                                   [(aid, role, cluster["id"]) for aid, role in sorted(cluster["members"])])
+                db.execute("""UPDATE destination_state SET status='completed',phase='completed',error=NULL,
+                    published_revision=?,progress_done=progress_total WHERE id=1""", (revision,))
+                db.commit()
+        except Exception:
+            LOG.exception("Destination clustering failed")
+            if revision is not None:
+                with closing(connect()) as db:
+                    db.execute("UPDATE destination_state SET status='failed',error='Destination processing failed. Retry clustering.' WHERE id=1 AND revision=?", (revision,))
+                    db.commit()
+            stop.wait(1)
+
+
+def destination_summary(db, sport="all", destination_id=None):
+    conditions, params = ["d.active=1"], []
+    if sport != "all":
+        conditions.append("a.sport=?")
+        params.append(sport)
+    if destination_id is not None:
+        conditions.append("d.id=?")
+        params.append(destination_id)
+    return [dict(row) for row in db.execute(f"""SELECT d.id,d.name,d.centroid_lat,d.centroid_lon,
+        COUNT(DISTINCT m.activity_id) AS trip_count,
+        SUM(m.role='start') AS departure_count,SUM(m.role='end') AS arrival_count,
+        MAX(COALESCE(e.recorded_at,a.start_time)) AS latest_visit
+        FROM destinations d JOIN destination_memberships m ON m.destination_id=d.id
+        JOIN activity_endpoints e ON e.activity_id=m.activity_id AND e.role=m.role
+        JOIN activities a ON a.id=m.activity_id WHERE {' AND '.join(conditions)}
+        GROUP BY d.id ORDER BY trip_count DESC,arrival_count DESC,d.id""", params)]
+
+
 def activity_medals(db):
     """Podium results for the overview, calculated in one query for all activities."""
     medals = {}
@@ -652,6 +905,8 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
+        if urlsplit(self.path).path.startswith("/api/destinations"):
+            return self.destination_request("GET")
         if urlsplit(self.path).path.startswith("/api/segments"):
             return self.segment_request("GET")
         if self.path.startswith("/api/activities"):
@@ -704,13 +959,130 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
-        self.segment_request("POST")
+        self.mutation_request("POST")
 
     def do_PUT(self):
-        self.segment_request("PUT")
+        self.mutation_request("PUT")
 
     def do_DELETE(self):
-        self.segment_request("DELETE")
+        self.mutation_request("DELETE")
+
+    def mutation_request(self, method):
+        if urlsplit(self.path).path.startswith("/api/destinations"):
+            return self.destination_request(method)
+        return self.segment_request(method)
+
+    def mutation_payload(self):
+        host = self.headers.get("Host", "").lower()
+        configured_hosts = os.environ.get("GARMIN_ALLOWED_HOSTS", "")
+        allowed = {value.strip().lower() for value in configured_hosts.split(",") if value.strip()}
+        if not allowed:
+            allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+        origin = self.headers.get("Origin")
+        if (host not in allowed or self.headers.get("Sec-Fetch-Site") == "cross-site" or
+            (origin is not None and origin != f"http://{host}")):
+            raise SegmentError(403, "Only same-origin requests are allowed.")
+        if self.headers.get_content_type() != "application/json":
+            raise SegmentError(415, "Send an application/json request.")
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if not 0 < size <= 65536:
+                raise ValueError()
+            payload = json.loads(self.rfile.read(size))
+        except (ValueError, UnicodeDecodeError):
+            raise SegmentError(400, "Invalid JSON request (maximum 64 KB).")
+        if not isinstance(payload, dict):
+            raise SegmentError(400, "Expected a JSON object.")
+        return payload
+
+    def destination_request(self, method):
+        try:
+            parsed = urlsplit(self.path)
+            parts = parsed.path.strip("/").split("/")
+            if parts[:2] != ["api", "destinations"]:
+                raise SegmentError(404, "API endpoint not found.")
+            payload = self.mutation_payload() if method != "GET" else {}
+            query = parse_qs(parsed.query)
+            sport = query.get("sport", ["all"])[0]
+            with closing(connect()) as db:
+                if method == "GET":
+                    db.execute("BEGIN")
+                if len(parts) == 2 and method == "GET":
+                    state = dict(db.execute("SELECT * FROM destination_state WHERE id=1").fetchone())
+                    filter_sql, params = ("", ()) if sport == "all" else (" AND a.sport=?", (sport,))
+                    noise = db.execute(f"""SELECT COUNT(*) FROM activity_endpoints e
+                        JOIN activities a ON a.id=e.activity_id LEFT JOIN destination_memberships m
+                        ON m.activity_id=e.activity_id AND m.role=e.role WHERE m.destination_id IS NULL {filter_sql}""", params).fetchone()[0]
+                    excluded = db.execute(f"""SELECT COUNT(*) FROM activities a
+                        JOIN destination_endpoint_sources s ON s.activity_id=a.id
+                        WHERE NOT EXISTS(SELECT 1 FROM activity_endpoints e WHERE e.activity_id=a.id) {filter_sql}""", params).fetchone()[0]
+                    return self.send_json({"destinations": destination_summary(db, sport), "processing": state,
+                                           "unassigned_endpoint_count": noise, "excluded_activity_count": excluded})
+                if parts[2:] == ["settings"] and method == "GET":
+                    return self.send_json(dict(db.execute("SELECT * FROM destination_state WHERE id=1").fetchone()))
+                if parts[2:] == ["settings"] and method == "PUT":
+                    epsilon, minimum = payload.get("epsilon_m"), payload.get("min_trips")
+                    if isinstance(epsilon, bool) or not isinstance(epsilon, (float, int)) or not math.isfinite(epsilon) or not 10 <= epsilon <= 1000:
+                        raise SegmentError(400, "Neighborhood distance must be between 10 and 1000 metres.")
+                    if isinstance(minimum, bool) or not isinstance(minimum, int) or not 2 <= minimum <= 100:
+                        raise SegmentError(400, "Minimum distinct trips must be an integer from 2 to 100.")
+                    db.execute("""UPDATE destination_state SET epsilon_m=?,min_trips=?,revision=revision+1,
+                        status='pending',phase='endpoints',error=NULL,progress_done=0,progress_total=0,changed_at=?
+                        WHERE id=1""", (epsilon, minimum, time.time()))
+                    db.commit()
+                    return self.send_json(dict(db.execute("SELECT * FROM destination_state WHERE id=1").fetchone()), 202)
+                if parts[2:] == ["reprocess"] and method == "POST":
+                    db.execute("""UPDATE destination_state SET revision=revision+1,status='pending',phase='endpoints',
+                        error=NULL,progress_done=0,progress_total=0,changed_at=? WHERE id=1""", (time.time(),))
+                    db.commit()
+                    return self.send_json(dict(db.execute("SELECT * FROM destination_state WHERE id=1").fetchone()), 202)
+                if len(parts) < 3 or parts[2] in {"settings", "reprocess"}:
+                    raise SegmentError(405, "Method not allowed.")
+                did = unquote(parts[2])
+                destination = db.execute("SELECT * FROM destinations WHERE id=?", (did,)).fetchone()
+                if destination is None:
+                    raise SegmentError(404, "Destination not found.")
+                if not destination["active"]:
+                    raise SegmentError(409, "This destination is no longer active. Refresh the destination list.")
+                if len(parts) == 3 and method == "PUT":
+                    name = payload.get("name")
+                    if name is not None and (not isinstance(name, str) or len(name.strip()) > 120):
+                        raise SegmentError(400, "A destination name must have at most 120 characters.")
+                    db.execute("UPDATE destinations SET name=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                               (name.strip() or None if name is not None else None, did))
+                    db.commit()
+                    return self.send_json(dict(db.execute("SELECT * FROM destinations WHERE id=?", (did,)).fetchone()))
+                if method != "GET":
+                    raise SegmentError(405, "Method not allowed.")
+                summaries = destination_summary(db, sport, did)
+                if not summaries:
+                    raise SegmentError(404, "No trips for this destination and sport.")
+                filter_sql, params = ("", (did,)) if sport == "all" else (" AND a.sport=?", (did, sport))
+                if len(parts) == 3:
+                    endpoints = [dict(r) for r in db.execute(f"""SELECT e.* FROM activity_endpoints e
+                        JOIN destination_memberships m ON m.activity_id=e.activity_id AND m.role=e.role
+                        JOIN activities a ON a.id=e.activity_id WHERE m.destination_id=? {filter_sql}
+                        ORDER BY e.activity_id,e.role""", params)]
+                    return self.send_json({"destination": summaries[0], "endpoints": endpoints})
+                if parts[3:] == ["activities"]:
+                    try:
+                        offset = max(0, int(query.get("offset", ["0"])[0]))
+                        limit = min(100, max(1, int(query.get("limit", ["50"])[0])))
+                    except ValueError:
+                        raise SegmentError(400, "Invalid pagination.")
+                    items = [dict(r) for r in db.execute(f"""SELECT a.id,a.start_time,a.sport,a.distance_m,
+                        a.duration_s,MAX(m.role='start') AS departed,MAX(m.role='end') AS arrived
+                        FROM destination_memberships m JOIN activities a ON a.id=m.activity_id
+                        WHERE m.destination_id=? {filter_sql} GROUP BY a.id
+                        ORDER BY a.start_time DESC,a.id LIMIT ? OFFSET ?""", (*params, limit, offset))]
+                    return self.send_json({"items": items, "total": summaries[0]["trip_count"],
+                                           "offset": offset, "limit": limit})
+                raise SegmentError(404, "API endpoint not found.")
+        except SegmentError as exc:
+            self.send_json({"error": exc.message}, exc.status)
+        except Exception:
+            LOG.exception("Destination API request failed")
+            self.send_json({"error": "Destination request failed. Please retry."}, 500)
 
     def segment_request(self, method):
         try:
@@ -718,29 +1090,7 @@ class Handler(SimpleHTTPRequestHandler):
             parts = parsed.path.strip("/").split("/")
             if parts[:2] != ["api", "segments"]:
                 raise SegmentError(404, "API endpoint not found.")
-            payload = {}
-            if method != "GET":
-                # Browser mutations must originate from this local application.
-                host = self.headers.get("Host", "").lower()
-                configured_hosts = os.environ.get("GARMIN_ALLOWED_HOSTS", "")
-                allowed = {value.strip().lower() for value in configured_hosts.split(",") if value.strip()}
-                if not allowed:
-                    allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
-                origin = self.headers.get("Origin")
-                if (host not in allowed or self.headers.get("Sec-Fetch-Site") == "cross-site" or
-                    (origin is not None and origin != f"http://{host}")):
-                    raise SegmentError(403, "Only same-origin requests are allowed.")
-                if self.headers.get_content_type() != "application/json":
-                    raise SegmentError(415, "Send an application/json request.")
-                try:
-                    size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 65536:
-                        raise ValueError()
-                    payload = json.loads(self.rfile.read(size))
-                except (ValueError, UnicodeDecodeError):
-                    raise SegmentError(400, "Invalid JSON request (maximum 64 KB).")
-                if not isinstance(payload, dict):
-                    raise SegmentError(400, "Expected a JSON object.")
+            payload = self.mutation_payload() if method != "GET" else {}
             with closing(connect()) as db:
                 if len(parts) == 2:
                     if method == "GET":
@@ -859,6 +1209,7 @@ def main():
             db.execute("PRAGMA journal_mode=WAL")
         stop = threading.Event()
         worker = threading.Thread(target=segment_worker, args=(stop,), daemon=True, name="segment-matcher")
+        destinations_worker = threading.Thread(target=destination_worker, args=(stop,), daemon=True, name="destination-clustering")
         server = ThreadingHTTPServer((args.host, args.port), Handler)
 
         def terminate(signum, frame):
@@ -867,6 +1218,7 @@ def main():
         previous_sigterm = signal.signal(signal.SIGTERM, terminate)
         try:
             worker.start()
+            destinations_worker.start()
             print(f"Listening on http://{args.host}:{args.port}", flush=True)
             server.serve_forever()
         except KeyboardInterrupt:
@@ -876,6 +1228,8 @@ def main():
             server.server_close()
             if worker.ident is not None:
                 worker.join(timeout=25)
+            if destinations_worker.ident is not None:
+                destinations_worker.join(timeout=3)
             signal.signal(signal.SIGTERM, previous_sigterm)
 
 
