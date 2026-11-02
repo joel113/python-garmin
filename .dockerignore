@@ -1,0 +1,9 @@
+# Only the application and its locked dependency manifests enter the build.
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!README.md
+!app.py
+!web/
+!web/**

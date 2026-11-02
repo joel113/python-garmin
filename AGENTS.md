@@ -18,6 +18,7 @@ This is a local Garmin activity library. `app.py` imports and fetches FIT/GPX ac
 - `activities.sqlite3` holds both imported activity data and user-created segments. Imports can be rebuilt with `uv run python app.py import`; segment definitions require a database backup. Never delete or replace the database to rebuild activities.
 - Keep API credentials in `.env` or the shell environment. Never print, commit, or copy credentials into source code. `.env` and the SQLite database are Git-ignored.
 - The web server binds to localhost by default.
+- Docker Compose keeps SQLite data under `storage/`, mounts the existing activities and analysis folders, and publishes only localhost port 8001 by default. `GARMIN_DB_PATH` selects a database; `GARMIN_ALLOWED_HOSTS` controls permitted mutation hosts when ports are mapped. Never bake credentials or personal data into the image.
 
 ## Implementation conventions
 

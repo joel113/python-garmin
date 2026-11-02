@@ -13,6 +13,7 @@ import csv
 import time
 import math
 import threading
+import signal
 from contextlib import closing
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -56,6 +57,7 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
 
 
 def connect():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript("""
@@ -587,16 +589,78 @@ def traversal_geometry(db, traversal):
     return [at(start)] + [[r["lat"], r["lon"]] for r in rows if start < r["seq"] < end] + ([at(end)] if end != start else [])
 
 
+def activity_medals(db):
+    """Podium results for the overview, calculated in one query for all activities."""
+    medals = {}
+    rows = db.execute("""WITH best AS (
+        SELECT t.segment_id,t.activity_id,MIN(t.duration_s) AS best_time
+        FROM segment_traversals t JOIN segments s ON s.id=t.segment_id
+        WHERE s.status='completed' AND t.duration_s IS NOT NULL
+        GROUP BY t.segment_id,t.activity_id
+      ), ranked AS (
+        SELECT *,RANK() OVER (PARTITION BY segment_id ORDER BY ROUND(best_time,3)) AS rank FROM best
+      ) SELECT r.activity_id,r.segment_id,r.rank,s.name FROM ranked r
+        JOIN segments s ON s.id=r.segment_id WHERE r.rank<=3 ORDER BY r.rank,s.name,s.id""")
+    for row in rows:
+        medals.setdefault(row["activity_id"], []).append({
+            "segment_id": row["segment_id"], "name": row["name"], "rank": row["rank"]})
+    return medals
+
+
+def track_segment_results(db, aid):
+    """Activity medals compare each activity's best pass, with shared tie ranks."""
+    activity = db.execute("SELECT sport FROM activities WHERE id=?", (aid,)).fetchone()
+    if activity is None:
+        raise SegmentError(404, "Activity not found.")
+    result = {"segments": [], "pending_count": 0, "failed_count": 0}
+    result["pending_count"] = db.execute("SELECT COUNT(*) FROM segments WHERE sport=? AND status IN ('pending','processing')", (activity["sport"],)).fetchone()[0]
+    result["failed_count"] = db.execute("SELECT COUNT(*) FROM segments WHERE sport=? AND status='failed'", (activity["sport"],)).fetchone()[0]
+    segments = db.execute("""SELECT DISTINCT s.id,s.name,s.sport,s.radius_m
+        FROM segments s JOIN segment_traversals t ON t.segment_id=s.id
+        WHERE t.activity_id=? AND s.status='completed' ORDER BY s.name,s.id""", (aid,)).fetchall()
+    for row in segments:
+        segment = dict(row)
+        sid = segment["id"]
+        segment["checkpoints"] = [list(p) for p in db.execute(
+            "SELECT lat,lon FROM segment_checkpoints WHERE segment_id=? ORDER BY seq", (sid,))]
+        ranked = db.execute("""WITH best AS (
+            SELECT activity_id,MIN(duration_s) AS best_duration_s
+            FROM segment_traversals WHERE segment_id=? AND duration_s IS NOT NULL GROUP BY activity_id
+          ), ranked AS (
+            SELECT *,RANK() OVER (ORDER BY ROUND(best_duration_s,3)) AS rank,
+              COUNT(*) OVER () AS ranked_activity_count FROM best
+          ) SELECT * FROM ranked WHERE activity_id=?""", (sid, aid)).fetchone()
+        segment.update(rank=ranked["rank"] if ranked else None,
+                       best_duration_s=ranked["best_duration_s"] if ranked else None,
+                       ranked_activity_count=ranked["ranked_activity_count"] if ranked else 0)
+        segment["traversals"] = []
+        for traversal in db.execute("SELECT * FROM segment_traversals WHERE segment_id=? AND activity_id=? ORDER BY ordinal", (sid, aid)).fetchall():
+            item = dict(traversal)
+            item["points"] = traversal_geometry(db, traversal)
+            segment["traversals"].append(item)
+        result["segments"].append(segment)
+    return result
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT / "web"), **kwargs)
+
+    def end_headers(self):
+        # UI assets must follow the running image, including after container rebuilds.
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
 
     def do_GET(self):
         if urlsplit(self.path).path.startswith("/api/segments"):
             return self.segment_request("GET")
         if self.path.startswith("/api/activities"):
-            with connect() as db:
+            with closing(connect()) as db:
+                db.execute("BEGIN")
+                medals = activity_medals(db)
                 rows = [dict(r) for r in db.execute("SELECT id,start_time,sport,duration_s,distance_m, EXISTS(SELECT 1 FROM track_points p WHERE p.activity_id=activities.id) AS has_track FROM activities ORDER BY start_time DESC")]
+                for row in rows:
+                    row["medals"] = medals.get(row["id"], [])
             return self.send_json(rows)
         if self.path.startswith("/api/heatmap"):
             sport = parse_qs(urlsplit(self.path).query).get("sport", ["all"])[0]
@@ -617,10 +681,24 @@ class Handler(SimpleHTTPRequestHandler):
                         routes.append({"id": aid, "sport": first["sport"], "segments": segments})
             return self.send_json(routes)
         if self.path.startswith("/api/track/"):
-            aid = self.path.split("/api/track/", 1)[1].split("?", 1)[0]
-            with connect() as db:
-                segments = display_segments(db.execute("SELECT lat,lon,timestamp FROM track_points WHERE activity_id=? ORDER BY seq", (aid,)))
-            return self.send_json(segments)
+            parts = urlsplit(self.path).path.strip("/").split("/")
+            if len(parts) < 3:
+                return self.send_json({"error": "Activity not found."}, 404)
+            aid = unquote(parts[2])
+            try:
+                with closing(connect()) as db:
+                    db.execute("BEGIN")
+                    if len(parts) == 4 and parts[3] == "segments":
+                        return self.send_json(track_segment_results(db, aid))
+                    if len(parts) != 3:
+                        raise SegmentError(404, "API endpoint not found.")
+                    segments = display_segments(db.execute("SELECT lat,lon,timestamp FROM track_points WHERE activity_id=? ORDER BY seq", (aid,)))
+                    return self.send_json(segments)
+            except SegmentError as exc:
+                return self.send_json({"error": exc.message}, exc.status)
+            except Exception:
+                LOG.exception("Could not load track details")
+                return self.send_json({"error": "Track details could not be loaded."}, 500)
         if self.path == "/" or self.path.startswith("/?"):
             self.path = "/index.html"
         return super().do_GET()
@@ -643,8 +721,11 @@ class Handler(SimpleHTTPRequestHandler):
             payload = {}
             if method != "GET":
                 # Browser mutations must originate from this local application.
-                host = self.headers.get("Host", "")
-                allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
+                host = self.headers.get("Host", "").lower()
+                configured_hosts = os.environ.get("GARMIN_ALLOWED_HOSTS", "")
+                allowed = {value.strip().lower() for value in configured_hosts.split(",") if value.strip()}
+                if not allowed:
+                    allowed = {f"127.0.0.1:{self.server.server_port}", f"localhost:{self.server.server_port}"}
                 origin = self.headers.get("Origin")
                 if (host not in allowed or self.headers.get("Sec-Fetch-Site") == "cross-site" or
                     (origin is not None and origin != f"http://{host}")):
@@ -748,13 +829,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
 
 def main():
+    global DB_PATH
     load_dotenv()
+    configured_db = Path(os.environ.get("GARMIN_DB_PATH") or ROOT / "activities.sqlite3").expanduser()
+    DB_PATH = configured_db if configured_db.is_absolute() else ROOT / configured_db
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("import", help="Import FIT files from activities/")
@@ -763,6 +846,7 @@ def main():
     sub.add_parser("export-map", help="Export a static Folium map to analysis/activities_map.html")
     serve = sub.add_parser("serve", help="Run the local activity map")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument("--host", default="127.0.0.1", help="Bind address (use 0.0.0.0 inside Docker)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     if args.command == "import": import_all()
@@ -775,17 +859,24 @@ def main():
             db.execute("PRAGMA journal_mode=WAL")
         stop = threading.Event()
         worker = threading.Thread(target=segment_worker, args=(stop,), daemon=True, name="segment-matcher")
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-        worker.start()
-        print(f"Open http://127.0.0.1:{args.port}")
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
+
+        def terminate(signum, frame):
+            raise KeyboardInterrupt
+
+        previous_sigterm = signal.signal(signal.SIGTERM, terminate)
         try:
+            worker.start()
+            print(f"Listening on http://{args.host}:{args.port}", flush=True)
             server.serve_forever()
         except KeyboardInterrupt:
             pass
         finally:
             stop.set()
             server.server_close()
-            worker.join(timeout=5)
+            if worker.ident is not None:
+                worker.join(timeout=25)
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,17 @@ const sportName = value => (value || "Unspecified").replaceAll("_"," ");
 const escape = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 let activities=[], selected=null, heatVersion=0, trackVersion=0;
 const maps={}, layers={};
+let trackSegmentData=[], trackSegmentPoll=null, trackSegmentRequest=0;
+const segmentTime=value=>{
+  if(value==null) return "Untimed";
+  const tenths=Math.round(Number(value)*10), h=Math.floor(tenths/36000), m=Math.floor(tenths%36000/600), s=(tenths%600/10).toFixed(1).padStart(4,"0");
+  return (h ? h+":"+String(m).padStart(2,"0") : String(m))+":"+s;
+};
+const medalInfo=rank=>({
+  1:{image:"/assets/medals/gold-abstract.png",label:"Gold · 1st",color:"#b8860b",className:"gold"},
+  2:{image:"/assets/medals/silver-abstract.png",label:"Silver · 2nd",color:"#62788b",className:"silver"},
+  3:{image:"/assets/medals/bronze-abstract.png",label:"Bronze · 3rd",color:"#ad622e",className:"bronze"}
+}[rank]);
 async function getJSON(url) {
   const response=await fetch(url);
   if (!response.ok) throw new Error("Could not load activity data (HTTP "+response.status+").");
@@ -147,6 +158,19 @@ function renderList() {
     const button=document.createElement("button");
     button.className="activity"+(a.id===selected ? " active":"");
     button.innerHTML="<strong>"+escape(date(a.start_time))+" · "+escape(sportName(a.sport))+"</strong><span class='small'>"+escape(km(a.distance_m))+" · "+escape(a.id)+(a.has_track ? "" : " · No GPS")+"</span>";
+    const medals=document.createElement("span");medals.className="activity-medals";
+    for(const rank of [1,2,3]) {
+      const awards=(a.medals || []).filter(m=>m.rank===rank);
+      if(!awards.length) continue;
+      const medal=medalInfo(rank),badge=document.createElement("span");badge.className="activity-medal medal-"+medal.className;
+      const image=document.createElement("img");image.src=medal.image;image.alt=medal.label;image.width=24;image.height=28;image.loading="lazy";
+      badge.title=awards.map(m=>m.name).join("\n");
+      badge.setAttribute("aria-label",medal.label+": "+awards.length+" segment"+(awards.length===1?"":"s"));
+      const count=document.createElement("span");count.textContent=awards.length+" x";
+      badge.append(count,image);
+      medals.append(badge);
+    }
+    if(medals.childElementCount) button.append(medals);
     button.onclick=()=>showTrack(a.id); fragment.append(button);
   }
   if (!filtered.length) { const empty=document.createElement("p"); empty.className="empty"; empty.textContent="No activities found."; fragment.append(empty); }
@@ -154,18 +178,148 @@ function renderList() {
 }
 async function showTrack(id) {
   const version=++trackVersion; selected=id; renderList();
+  clearTimeout(trackSegmentPoll);
+  trackSegmentData=[];
+  if(layers.trackSegments) layers.trackSegments.clearLayers();
+  if(layers.trackSegmentFocus) layers.trackSegmentFocus.clearLayers();
+  $("#track-details").hidden=false;
+  const activity=activities.find(a=>a.id===id);
+  $("#track-overview").textContent=activity ? date(activity.start_time)+" · "+sportName(activity.sport)+" · "+km(activity.distance_m)+" · "+hours(activity.duration_s)+" · Activity "+id : "Activity "+id;
+  $("#track-segment-results").replaceChildren();
+  $("#track-segment-status").textContent="Loading segment results…";
   $("#track-status").textContent="Loading route…";
   try {
     const map=getMap("map");
+    ensureTrackSegmentPanes();
+    loadTrackSegments(id,version);
     if (layers.track) { map.removeLayer(layers.track); layers.track=null; }
     const points=await getJSON("/api/track/"+encodeURIComponent(id));
     if (version!==trackVersion) return;
     if (!points.length) { $("#track-status").textContent="This activity has no GPS track."; return; }
     layers.track=L.polyline(points,{color:"#087e8b",weight:4}).addTo(map);
+    layers.track.bringToBack();
     map.invalidateSize(); map.fitBounds(layers.track.getBounds(),{padding:[24,24],maxZoom:16});
     const a=activities.find(a=>a.id===id);
     $("#track-status").textContent=a ? date(a.start_time)+" · "+sportName(a.sport)+" · "+km(a.distance_m)+" · "+hours(a.duration_s) : id;
   } catch(error) { $("#track-status").textContent="Could not load this route."; report(error); }
+}
+async function loadTrackSegments(id,version) {
+  const request=++trackSegmentRequest;
+  clearTimeout(trackSegmentPoll);
+  try {
+    const result=await getJSON("/api/track/"+encodeURIComponent(id)+"/segments");
+    if(version!==trackVersion || request!==trackSegmentRequest || $("#tracks").hidden) return;
+    trackSegmentData=result.segments;
+    const activity=activities.find(a=>a.id===id);
+    if(activity) {
+      activity.medals=result.segments.filter(s=>s.rank!=null && s.rank<=3).map(s=>({segment_id:s.id,name:s.name,rank:s.rank}));
+      renderList();
+    }
+    renderTrackSegments();
+    drawTrackSegments();
+    let text=trackSegmentData.length ? "Medals compare each activity's best timed pass; ties share a rank. Checkpoints and traversed portions appear on the map." : "No completed segment matches for this activity.";
+    if(result.pending_count) text+=" "+result.pending_count+" segment(s) are being processed; results refresh automatically.";
+    if(result.failed_count) text+=" "+result.failed_count+" segment(s) failed matching; open Segments to retry.";
+    $("#track-segment-status").textContent=text;
+    requestAnimationFrame(()=>{if(maps.map) maps.map.invalidateSize({pan:false});});
+    if(result.pending_count && !$("#tracks").hidden) trackSegmentPoll=setTimeout(()=>loadTrackSegments(id,version),2000);
+  } catch(error) {
+    if(version===trackVersion && request===trackSegmentRequest) $("#track-segment-status").textContent="Could not load segment results. "+error.message;
+  }
+}
+function renderTrackSegments() {
+  $("#track-segment-results").replaceChildren();
+  for(const segment of trackSegmentData) {
+    const card=document.createElement("article");card.className="track-segment-card";
+    const medal=medalInfo(segment.rank), heading=document.createElement("div");heading.className="segment-result-heading";
+    const name=document.createElement("button");name.className="segment-name";name.textContent=segment.name;
+    name.onclick=()=>focusTrackSegment(segment.id);
+    heading.append(name);
+    if(medal) {
+      const badge=document.createElement("span");badge.className="medal medal-"+medal.className;
+      const artwork=document.createElement("img");artwork.src=medal.image;artwork.className="medal-art";artwork.alt="";artwork.width=38;artwork.height=44;
+      badge.append(artwork,document.createTextNode(medal.label));badge.setAttribute("aria-label",medal.label+" place");
+      heading.append(badge);
+    }
+    const info=document.createElement("p");info.className="small";
+    const visits=segment.checkpoints.length===1;
+    info.textContent=segment.traversals.length+(visits ? " visits" : " traversals")+(segment.rank!=null ?
+      " · Best "+segmentTime(segment.best_duration_s)+" · Rank "+segment.rank+" of "+segment.ranked_activity_count+" activities" :
+      visits ? " · Visits are not timed or ranked" : " · No timed pass available");
+    const passes=document.createElement("details"), summary=document.createElement("summary");
+    summary.textContent=visits ? "Show visits" : "Show traversal times";passes.append(summary);
+    for(const traversal of segment.traversals) {
+      const button=document.createElement("button");button.className="track-pass";
+      button.textContent=(visits ? "Visit " : "Pass ")+traversal.ordinal+(visits ? "" : " · "+segmentTime(traversal.duration_s));
+      button.onclick=()=>focusTrackSegment(segment.id,traversal.id);
+      passes.append(button);
+    }
+    const zoom=document.createElement("button");zoom.className="segment-zoom";
+    zoom.textContent="Show segment on map";zoom.onclick=()=>focusTrackSegment(segment.id);
+    card.append(heading,info,zoom,passes);$("#track-segment-results").append(card);
+  }
+}
+function ensureTrackSegmentPanes() {
+  if(!maps.map) return;
+  // Dedicated panes make ordering independent of which request completes first.
+  for(const [name,zIndex] of [["track-segments",450],["track-segment-focus",460]]) {
+    if(!maps.map.getPane(name)) maps.map.createPane(name).style.zIndex=String(zIndex);
+  }
+}
+function drawTrackSegments() {
+  if(!maps.map) return;
+  ensureTrackSegmentPanes();
+  if(!layers.trackSegments) layers.trackSegments=L.featureGroup().addTo(maps.map);
+  if(!layers.trackSegmentFocus) layers.trackSegmentFocus=L.featureGroup().addTo(maps.map);
+  layers.trackSegments.clearLayers();layers.trackSegmentFocus.clearLayers();
+  if(!$("#track-show-segments").checked) return;
+  for(const segment of trackSegmentData) {
+    const medal=medalInfo(segment.rank),color=medal ? medal.color : "#d66c19";
+    const label=()=>{const span=document.createElement("span");span.textContent=segment.name+(medal?" · "+medal.label:"");return span;};
+    for(const checkpoint of segment.checkpoints) {
+      L.circle(checkpoint,{pane:"track-segments",radius:segment.radius_m,color,weight:2,fillOpacity:0.1,interactive:false}).addTo(layers.trackSegments);
+    }
+    const icon=L.divIcon({
+      className:medal ? "medal-map-icon" : "track-segment-icon",
+      html:medal ? '<img src="'+medal.image+'" alt="'+medal.label+'" width="26" height="30">' : "S",
+      iconSize:medal ? [26,30] : [28,28],iconAnchor:medal ? [13,25] : [14,14]
+    });
+    const marker=L.marker(segment.checkpoints[0],{icon}).addTo(layers.trackSegments);
+    marker.bindTooltip(label(),{permanent:true,direction:"top",offset:[0,medal ? -25 : -14],className:"track-segment-label"});
+    marker.on("click",()=>focusTrackSegment(segment.id));
+    if(segment.checkpoints.length>1) {
+      const endIcon=L.divIcon({className:"track-segment-icon track-segment-end",html:"F",iconSize:[24,24],iconAnchor:[12,12]});
+      const end=L.marker(segment.checkpoints.at(-1),{icon:endIcon}).addTo(layers.trackSegments);
+      end.bindTooltip(label());end.on("click",()=>focusTrackSegment(segment.id));
+    }
+    for(const traversal of segment.traversals) {
+      if(traversal.points.length>1) L.polyline(traversal.points,{pane:"track-segments",color:"#fff",weight:10,opacity:0.9,interactive:false}).addTo(layers.trackSegments);
+      const line=traversal.points.length===1 ? L.circleMarker(traversal.points[0],{pane:"track-segments",radius:7,color,fillOpacity:0.9}) :
+        L.polyline(traversal.points,{pane:"track-segments",color,weight:6,opacity:1});
+      line.addTo(layers.trackSegments).bindTooltip(label());
+      line.on("click",()=>focusTrackSegment(segment.id,traversal.id));
+    }
+  }
+}
+function focusTrackSegment(id,traversalId=null) {
+  const segment=trackSegmentData.find(s=>s.id===id);
+  if(!segment || !maps.map) return;
+  $("#track-show-segments").checked=true;drawTrackSegments();
+  const traversals=traversalId ? segment.traversals.filter(t=>t.id===traversalId) : segment.traversals;
+  const medal=medalInfo(segment.rank), color=medal ? medal.color : "#d66c19";
+  for(const traversal of traversals) {
+    if(traversal.points.length===1) L.circleMarker(traversal.points[0],{pane:"track-segment-focus",radius:10,color,fillOpacity:1}).addTo(layers.trackSegmentFocus);
+    else {
+      L.polyline(traversal.points,{pane:"track-segment-focus",color:"#fff",weight:12,opacity:1,interactive:false}).addTo(layers.trackSegmentFocus);
+      L.polyline(traversal.points,{pane:"track-segment-focus",color,weight:8,opacity:1}).addTo(layers.trackSegmentFocus);
+    }
+  }
+  const bounds=layers.trackSegmentFocus.getBounds();
+  if(bounds.isValid()) {
+    maps.map.invalidateSize();
+    maps.map.fitBounds(bounds,{padding:[45,45],maxZoom:17});
+    $("#map").scrollIntoView({block:"nearest",behavior:"smooth"});
+  }
 }
 function heatStyle() {
   const individual=$("#heat-mode").value==="individual";
@@ -205,6 +359,7 @@ async function showHeat() {
 }
 function switchView(view) {
   if (window.segmentUI && !window.segmentUI.allowNavigate(view)) return false;
+  clearTimeout(trackSegmentPoll);
   document.querySelectorAll(".view").forEach(section=>section.hidden=section.id!==view);
   document.querySelectorAll("[data-view]").forEach(button=>{if(button.dataset.view===view) button.setAttribute("aria-current","page"); else button.removeAttribute("aria-current");});
   requestAnimationFrame(()=>{
@@ -214,6 +369,7 @@ function switchView(view) {
       if (view==="tracks") {
         getMap("map");
         if (!selected) { const first=activities.find(a=>a.has_track); if (first) showTrack(first.id); }
+        else loadTrackSegments(selected,trackVersion);
       }
     } catch(error) { report(error); }
   });
@@ -223,6 +379,7 @@ document.querySelectorAll("[data-view]").forEach(button=>button.onclick=()=>swit
 $("#sport-filter").onchange=showHeat; $("#search").oninput=renderList;
 $("#heat-mode").onchange=updateHeatStyle;
 $("#heat-color").oninput=updateHeatStyle;
+$("#track-show-segments").onchange=drawTrackSegments;
 $("#compare-unit").onchange=populateComparisonPeriods;
 ["#compare-sport","#compare-a","#compare-b"].forEach(selector=>$(selector).onchange=renderComparison);
 getJSON("/api/activities").then(data=>{activities=data; summary(); renderList();}).catch(error=>{ $("#date-range").textContent="Activity data could not be loaded. Restart the server and refresh."; report(error); });
