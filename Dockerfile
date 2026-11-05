@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \
     GARMIN_DB_PATH=/data/activities.sqlite3 \
+    GARMIN_ACTIVITIES_PATH=/data/activities \
     PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
@@ -15,8 +16,8 @@ RUN uv sync --locked --no-dev --no-install-project --no-cache
 
 RUN groupadd --gid 1000 app \
     && useradd --uid 1000 --gid app --create-home app \
-    && mkdir -p /data /app/activities /app/analysis \
-    && chown app:app /data /app/activities /app/analysis
+    && mkdir -p /data/activities /app/analysis \
+    && chown -R app:app /data /app/analysis
 
 COPY app.py ./
 COPY web/ ./web/

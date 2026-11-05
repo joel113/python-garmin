@@ -8,10 +8,10 @@ services:
       - "127.0.0.1:${APP_PORT:-8001}:8000"
     environment:
       GARMIN_DB_PATH: /data/activities.sqlite3
+      GARMIN_ACTIVITIES_PATH: /data/activities
       GARMIN_ALLOWED_HOSTS: "localhost:${APP_PORT:-8001},127.0.0.1:${APP_PORT:-8001}"
       GARMIN_API_KEY: "${GARMIN_API_KEY:-}"
     volumes:
-      - ./activities:/app/activities
       - ./analysis:/app/analysis
       - ./storage:/data
     restart: unless-stopped

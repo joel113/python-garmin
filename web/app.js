@@ -9,6 +9,8 @@ const escape = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp
 let activities=[], selected=null, heatVersion=0, trackVersion=0;
 const maps={}, layers={};
 let trackSegmentData=[], trackSegmentPoll=null, trackSegmentRequest=0;
+let trackCoordinates=[],trackSpeedData=null,trackTemperatureData=null,trackSpeedRequest=0;
+const trackColorMode=()=>$("#track-color-temperature").checked?"temperature":$("#track-color-speed").checked?"speed":null;
 const segmentTime=value=>{
   if(value==null) return "Untimed";
   const tenths=Math.round(Number(value)*10), h=Math.floor(tenths/36000), m=Math.floor(tenths%36000/600), s=(tenths%600/10).toFixed(1).padStart(4,"0");
@@ -179,6 +181,8 @@ function renderList() {
 }
 async function showTrack(id) {
   const version=++trackVersion; selected=id; renderList();
+  trackSpeedRequest++;trackCoordinates=[];trackSpeedData=null;trackTemperatureData=null;
+  $("#track-speed-legend").hidden=true;
   clearTimeout(trackSegmentPoll);
   trackSegmentData=[];
   if(layers.trackSegments) layers.trackSegments.clearLayers();
@@ -197,12 +201,82 @@ async function showTrack(id) {
     const points=await getJSON("/api/track/"+encodeURIComponent(id));
     if (version!==trackVersion) return;
     if (!points.length) { $("#track-status").textContent="This activity has no GPS track."; return; }
-    layers.track=L.polyline(points,{color:"#087e8b",weight:4}).addTo(map);
-    layers.track.bringToBack();
+    trackCoordinates=points;
+    renderTrackRoute();
     map.invalidateSize(); map.fitBounds(layers.track.getBounds(),{padding:[24,24],maxZoom:16});
+    if(trackColorMode()) loadTrackSpeed();
     const a=activities.find(a=>a.id===id);
     $("#track-status").textContent=a ? date(a.start_time)+" · "+sportName(a.sport)+" · "+km(a.distance_m)+" · "+hours(a.duration_s) : id;
   } catch(error) { $("#track-status").textContent="Could not load this route."; report(error); }
+}
+function renderTrackRoute() {
+  if(!maps.map || !trackCoordinates.length) return;
+  if(layers.track) maps.map.removeLayer(layers.track);
+  const mode=trackColorMode(),temperature=mode==="temperature";
+  const data=temperature?trackTemperatureData:mode==="speed"?trackSpeedData:null;
+  const coloring=data && (!temperature || data.known_edge_count>0);
+  $("#track-speed-legend").hidden=!data;
+  $("#track-color-low").textContent=temperature?"Cold · blue":"Slow · blue";
+  $("#track-color-high").textContent=temperature?"Warm · red":"Fast · red";
+  $("#track-color-note").textContent=temperature?
+    "Recorded sensor temperature in °C. Gray sections have missing readings. Segment overlays keep their medal colors.":
+    "Speed estimated from GPS distance and timestamps. Gray means unavailable; red starts at this track's 95th-percentile speed. Segment overlays keep their medal colors.";
+  if(!coloring) {
+    layers.track=L.polyline(trackCoordinates,{color:"#087e8b",weight:4}).addTo(maps.map);
+    layers.track.bringToBack();
+    if(temperature && data) $("#track-speed-range").textContent=data.message || "No usable recorded temperature data for this track.";
+    requestAnimationFrame(()=>maps.map.invalidateSize({pan:false}));
+    return;
+  }
+  layers.track=L.featureGroup().addTo(maps.map);
+  const floor=temperature?data.scale_min_c:0,ceiling=temperature?data.scale_max_c:data.scale_max_kmh;
+  for(const segment of data.segments) {
+    const samples=temperature?segment.temperatures_c:segment.speeds_kmh;
+    let chunk=[],values=[],previousBin=null;
+    const finish=()=>{
+      if(chunk.length<2) return;
+      const color=previousBin===-1?"#94a3b8":"hsl("+(240-240*previousBin/19)+",90%,45%)";
+      const line=L.polyline(chunk,{color,weight:4.5,opacity:1}).addTo(layers.track);
+      const tooltip=document.createElement("span");
+      const minimum=values.reduce((a,b)=>Math.min(a,b),Infinity),maximum=values.reduce((a,b)=>Math.max(a,b),-Infinity);
+      tooltip.textContent=values.length ? (temperature?"Recorded temperature: ":"Estimated speed: ")+minimum.toFixed(1)+"–"+maximum.toFixed(1)+(temperature?" °C":" km/h") :
+        temperature?"Temperature unavailable":"Speed unavailable";
+      line.bindTooltip(tooltip);
+    };
+    for(let index=0;index<samples.length;index++) {
+      const speed=samples[index];
+      const ratio=temperature?(ceiling>floor?(speed-floor)/(ceiling-floor):0.5):(ceiling>0?speed/ceiling:0);
+      const bin=speed==null?-1:Math.max(0,Math.min(19,Math.floor(ratio*19)));
+      if(bin!==previousBin) {
+        finish();chunk=[segment.points[index]];values=[];previousBin=bin;
+      }
+      chunk.push(segment.points[index+1]);
+      if(speed!=null) values.push(speed);
+    }
+    finish();
+  }
+  layers.track.bringToBack();
+  $("#track-speed-range").textContent=temperature ?
+    (floor===ceiling?"Constant temperature · "+floor.toFixed(1)+" °C":floor.toFixed(1)+" °C → "+ceiling.toFixed(1)+" °C") :
+    ceiling==null ? "No usable timestamps: the route is shown in gray." :
+    ceiling===0 ? "Stationary track · 0 km/h" : "0 km/h → "+ceiling.toFixed(1)+" km/h and faster";
+  requestAnimationFrame(()=>maps.map.invalidateSize({pan:false}));
+}
+async function loadTrackSpeed() {
+  const token=++trackSpeedRequest,version=trackVersion,id=selected,mode=trackColorMode();
+  if(!id || !trackCoordinates.length) return;
+  if(!mode) {renderTrackRoute();return;}
+  if(mode==="speed"?trackSpeedData:trackTemperatureData) {renderTrackRoute();return;}
+  $("#track-speed-legend").hidden=false;
+  $("#track-speed-range").textContent=mode==="temperature"?"Loading recorded temperature…":"Loading speed data…";
+  try {
+    const data=await getJSON("/api/track/"+encodeURIComponent(id)+"/"+mode);
+    if(token!==trackSpeedRequest || version!==trackVersion || trackColorMode()!==mode) return;
+    if(mode==="temperature") trackTemperatureData=data;else trackSpeedData=data;
+    renderTrackRoute();
+  } catch(error) {
+    if(token===trackSpeedRequest && version===trackVersion) $("#track-speed-range").textContent="Track coloring could not be loaded. "+error.message;
+  }
 }
 async function loadTrackSegments(id,version) {
   const request=++trackSegmentRequest;
@@ -359,7 +433,9 @@ async function showHeat() {
   } catch(error) { $("#heat-status").textContent="Could not load routes."; report(error); }
 }
 function switchView(view) {
+  if(window.routesUI && !window.routesUI.allowNavigate(view)) return false;
   if (window.segmentUI && !window.segmentUI.allowNavigate(view)) return false;
+  if(window.routesUI && view!=="routes") window.routesUI.hide();
   if(window.destinationUI && view!=="destinations") window.destinationUI.hide();
   clearTimeout(trackSegmentPoll);
   document.querySelectorAll(".view").forEach(section=>section.hidden=section.id!==view);
@@ -369,6 +445,7 @@ function switchView(view) {
       if (view==="heat") showHeat();
       if (view==="segments") window.segmentUI.show();
       if (view==="destinations") window.destinationUI.show();
+      if (view==="routes") window.routesUI.show();
       if (view==="tracks") {
         getMap("map");
         if (!selected) { const first=activities.find(a=>a.has_track); if (first) showTrack(first.id); }
@@ -383,6 +460,8 @@ $("#sport-filter").onchange=showHeat; $("#search").oninput=renderList;
 $("#heat-mode").onchange=updateHeatStyle;
 $("#heat-color").oninput=updateHeatStyle;
 $("#track-show-segments").onchange=drawTrackSegments;
+$("#track-color-speed").onchange=()=>{if($("#track-color-speed").checked) $("#track-color-temperature").checked=false;loadTrackSpeed();};
+$("#track-color-temperature").onchange=()=>{if($("#track-color-temperature").checked) $("#track-color-speed").checked=false;loadTrackSpeed();};
 $("#compare-unit").onchange=populateComparisonPeriods;
 ["#compare-sport","#compare-a","#compare-b"].forEach(selector=>$(selector).onchange=renderComparison);
 getJSON("/api/activities").then(data=>{activities=data; summary(); renderList();}).catch(error=>{ $("#date-range").textContent="Activity data could not be loaded. Restart the server and refresh."; report(error); });

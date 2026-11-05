@@ -14,3 +14,5 @@ activities.sqlite3-shm
 activities.sqlite3-wal
 activities-backup.sqlite3
 storage/
+/routes/
+/activities/

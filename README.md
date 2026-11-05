@@ -1,6 +1,6 @@
 # Garmin Activity Library
 
-This project stores Garmin FIT and GPX activities locally, indexes activity metadata and GPS points in SQLite, and provides a searchable web map. Source files remain in `activities/`. Imported activity data can be recreated from them; saved segment definitions and destination identities/custom names require a database backup.
+This project stores Garmin FIT and GPX activities locally, indexes activity metadata and GPS points in SQLite, and provides a searchable web map. It also keeps planned GPX routes in ordered collections with planning notes. Activity source files live in `storage/activities/`. Imported activity data can be recreated from them; saved segments, destination identities/custom names, and route notes/order require a database backup. Planned routes also require their original uploads beside the database.
 
 ## Setup
 
@@ -12,7 +12,7 @@ uv sync
 
 ## Import existing FIT files
 
-Import all `*.fit` and `*.gpx` files in `activities/` into the configured database (by default `activities.sqlite3`):
+Import all `*.fit` and `*.gpx` files in `storage/activities/` into the configured database (by default `activities.sqlite3`):
 
 ```bash
 uv run python app.py import
@@ -34,7 +34,7 @@ The app reads `.env` automatically. A value already set in the shell takes prece
 uv run python app.py fetch
 ```
 
-The fetch command saves supported FIT or GPX files to `activities/` and imports newly downloaded files. GPX distance and duration are derived from its track points and timestamps. Garmin API key and token details are documented in the [Personal API guide](https://developer.garmin.com/gc-developer-program/personal/personal-api/) and [FAQ](https://developer.garmin.com/gc-developer-program/personal/personal-faq/).
+The fetch command saves supported FIT or GPX files to `storage/activities/` and imports newly downloaded files. GPX distance and duration are derived from its track points and timestamps. Garmin API key and token details are documented in the [Personal API guide](https://developer.garmin.com/gc-developer-program/personal/personal-api/) and [FAQ](https://developer.garmin.com/gc-developer-program/personal/personal-faq/).
 
 ## Start the web application
 
@@ -42,7 +42,7 @@ The fetch command saves supported FIT or GPX files to `activities/` and imports 
 uv run python app.py serve
 ```
 
-Open <http://127.0.0.1:8000>. Use the left navigation to switch between Summary, Heatmap, Tracks, Segments, and Destinations. The summary shows totals, GPS coverage, sports, and recent activities. The heatmap draws all routes on a map with a sport filter; overlapping paths show frequently visited routes. Route coordinates are sampled for responsiveness. Tracks shows an activity list alongside its map and identifies activities without GPS. To choose another port, for example `9000`:
+Open <http://127.0.0.1:8000>. Use the left navigation to switch between Summary, Heatmap, Tracks, Segments, Destinations, and Routes. The summary shows totals, GPS coverage, sports, and recent activities. The heatmap draws all activity tracks on a map with a sport filter; overlapping paths show frequently visited routes. Coordinates are sampled for responsiveness. Tracks shows an activity list alongside its map and identifies activities without GPS. Routes holds planned journeys and their collection order. To choose another port, for example `9000`:
 
 ```bash
 uv run python app.py serve --port 9000
@@ -59,6 +59,12 @@ Tracks includes an activity details panel with its matched segments and traversa
 In the heatmap, choose **Overlapping routes** for the density view or **Individual tracks** for more visible routes that highlight on hover. Click a route to open its full track in Tracks. The route color picker updates either heatmap mode immediately.
 
 The Tracks activity list also shows gold, silver, and bronze medal icons for podium finishes on saved segments. Each badge puts the count before the icon (for example, `2 x` followed by a gold medal for two first-place segments); hover for the segment names. The abstract medal artwork also appears in track details and as compact 26 × 30 px map markers.
+
+Enable **Color track by speed** in Tracks to color the route from blue (slow) through cyan, green, and yellow to red (fast). A legend shows the scale for the selected track, using its 95th-percentile speed as the red threshold so occasional GPS spikes do not dominate the colors. Hover over a colored section for its estimated speed range. Speeds are calculated from stored GPS coordinates and timestamps, so no reimport is needed. Missing/non-increasing timestamps, intervals over five minutes, and implausible speeds above 198 km/h appear gray. Existing GPS discontinuities remain disconnected, and segment overlays remain above the speed colors. Turn the option off to restore the plain route without changing the map view.
+
+Enable **Color track by temperature** for blue-to-red coloring from the selected track's coldest to warmest recorded sensor readings, with a °C legend. Speed and temperature coloring are mutually exclusive; segment overlays remain independent. FIT record temperatures and Garmin GPX `atemp` extensions are supported. Each line section uses the mean of its available endpoint readings; sections with no readings are gray. Constant temperatures use a single color. Tracks with no usable temperature data retain the plain route with an unavailable message.
+
+Temperature is stored in the database for new imports. For existing tracks, the first temperature request reads and caches the source FIT/GPX file without reimporting the activity or changing segment/destination identities. Source coordinates are checked against the stored track before readings are attached. No weather service or inferred outdoor temperature is used.
 
 The heatmap uses an approximate budget of 800,000 coordinates across the selected sports, with reduced map simplification to preserve curves when zooming in. Larger selections can take longer to load; the Tracks view uses all stored coordinates.
 
@@ -96,14 +102,44 @@ New places receive a coordinate-based ID such as `dest_48.1672_11.5354`, rounded
 
 You can save an optional custom name such as Home or Office. Clearing the name returns to displaying the geographic ID. Names survive normal reclustering. Retired destinations and names remain in the database but do not appear in the active list. Back up the SQLite database to preserve names and identity history; source FIT/GPX files alone cannot reconstruct them. No reverse-geocoding service or Garmin request is used for destination discovery.
 
+## Planned Routes
+
+Open **Routes** to keep planned journeys separate from completed activities. Choose **Upload GPX** to upload one or several files. Each file can be up to 25 MiB and contain up to 200,000 points, including waypoints. GPX 1.0/1.1 tracks and routes are supported without timestamps; waypoint-only files are rejected. Track segments stay separate, and waypoints are shown as annotations rather than joined into the route line.
+
+Create a named **collection** for a trip or cycling holiday. Uploading while a collection is selected appends routes to its order. Drag routes into position, or use the up/down arrows. Each collection has its own saved order and numbered map markers. **All routes** is the library rather than a manually ordered collection.
+
+A route can belong to several collections. Select it in All routes and use **Add to collection** in its details to reuse it. Its name, sport, and planning notes are shared across those collections; the position is independent in each. Uploading an identical GPX reuses the existing route without replacing its metadata or notes.
+
+The map shows the collection together and highlights the selected route. Use **Show collection routes**, **Fit collection**, or **Zoom to route** to choose the view. Large collection previews may be simplified, while selecting a route loads its full geometry. Downloads always retain every original point and extension.
+
+Edit the selected route's name, sport, and plain-text notes, then choose **Save route**. Downloads include **Download original GPX** and **Download notes** as a separate text file. The GPX bytes remain exactly as uploaded, so renaming a route or editing notes does not change the original file's internal name or metadata. Distance is calculated within each track part; elevation gain is shown when available, with a partial-coverage label when needed.
+
+**Remove** removes one collection membership. **Delete route from library** removes the route, its notes, its original upload, and every membership after confirmation. Deleting a collection preserves all routes and notes. Concurrent collection changes are detected; refresh the collection and retry a stale reorder.
+
+Original uploads live in a `routes/` directory beside the configured database: normally `routes/` in the project root, or `storage/routes/` when using the container setup. The existing `storage/` mount already persists them. Back up **both the database and this directory** to preserve planned routes, notes, and collection order. For a consistent joint backup, stop the app before backing up the database with SQLite's backup API and copying its routes directory.
+
+For Komoot, export a planned route as GPX and upload that file here. Download a GPX to import it as a **course** in Garmin Connect using [Garmin's course-import instructions](https://support.garmin.com/en-US/?faq=wKuZXCaZRP4mWPX5aRz5h5). This version does not connect directly to Komoot accounts or publish through Garmin APIs; the existing Garmin Personal API key is for pulling data. Planned routes do not affect activity statistics, segments, or destination discovery.
+
 ## Run with Docker Compose
 
 Install Docker with Compose support (for example Docker Desktop), then use the commands below from the project root. The container runs Python 3.12 with dependencies installed from `uv.lock` during the build; it does not install packages at startup.
 
 ### Prepare host folders and configuration
 
+Persistent container data uses this layout:
+
+```text
+storage/
+├── activities.sqlite3
+├── activities/         # Original FIT/GPX activities
+├── routes/             # Original planned GPX routes
+└── backups/            # Dated database backups
+```
+
+If upgrading from the old root-level `activities/` folder, follow **Move an existing activity directory once** below before creating the destination directory.
+
 ```bash
-mkdir -p storage activities analysis
+mkdir -p storage/activities analysis
 id -u
 id -g
 ```
@@ -148,7 +184,29 @@ After migration, add the following to `.env` so your local `uv` commands use the
 GARMIN_DB_PATH=storage/activities.sqlite3
 ```
 
-For a fresh setup, you can set this path without migration; the first server startup imports the mounted activity files. Compose overrides the database path inside the container to `/data/activities.sqlite3`. Original FIT/GPX files stay in `activities/`, and exports stay in `analysis/`.
+For a fresh setup, you can set this path without migration; the first server startup imports the mounted activity files. Compose overrides the database path inside the container to `/data/activities.sqlite3`. Original FIT/GPX files live in `storage/activities/` (mounted at `/data/activities`), and exports stay in `analysis/`.
+
+### Move an existing activity directory once
+
+With the app stopped, move the old root-level directory into storage. Do this before creating `storage/activities/`; never overwrite an existing destination:
+
+```bash
+docker compose stop app
+mkdir -p storage
+uv run python - <<'PY'
+from pathlib import Path
+source = Path("activities")
+target = Path("storage/activities")
+if not source.is_dir():
+    raise SystemExit("No legacy activity directory to move.")
+if target.exists():
+    raise SystemExit("Destination exists; reconcile the directories without overwriting files.")
+source.rename(target)
+PY
+docker compose up --build -d --force-recreate
+```
+
+Existing database references such as `activities/123.fit` resolve to the new directory automatically. No reimport or database replacement is needed. The container now uses only the `storage/` mount for persistent personal data, plus the separate `analysis/` mount for generated exports. Local commands default to `storage/activities/` even when using an older project-root database.
 
 ### Start and manage the container
 
@@ -183,13 +241,13 @@ Run only one server per database. Stop the container before running a local `uv 
 
 ### Back up container data
 
-Back up `activities/` and create a consistent SQLite backup in the mounted storage folder:
+All persistent container data is under `storage/`: the database, `activities/`, `routes/`, and backups. Create a consistent SQLite backup in that folder:
 
 ```bash
 docker compose exec app python -c 'import sqlite3; source=sqlite3.connect("/data/activities.sqlite3"); target=sqlite3.connect("/data/activities-backup.sqlite3"); source.backup(target); target.close(); source.close()'
 ```
 
-The backup appears at `storage/activities-backup.sqlite3` on your computer. This command refreshes that backup file; copy dated backups elsewhere if you need history. Use SQLite's backup API rather than copying only the live database file, because committed data may still be in its WAL file. Keep `storage/` private; it is ignored by Git.
+The backup appears at `storage/activities-backup.sqlite3` on your computer. This command refreshes that backup file; copy dated backups elsewhere if you need history. Use SQLite's backup API rather than copying only the live database file, because committed data may still be in its WAL file. For a complete backup, stop the app and copy the whole `storage/` folder, including both original-file directories. Keep `storage/` private; it is ignored by Git.
 
 ## Optional exports for analysis
 
@@ -209,7 +267,7 @@ These commands write `analysis/activities.csv` and `analysis/activities_map.html
 
 ## Data and secrets
 
-- `activities/` contains source FIT and GPX files.
-- The configured SQLite database contains the searchable activity index, track points, saved segment definitions, cached traversals, and destination identities, names, and endpoint memberships. The default `activities.sqlite3` and Docker's `storage/` folder are ignored by Git and should be backed up. Ignore custom database locations too if they are inside the repository.
+- `storage/activities/` contains source FIT and GPX files. `GARMIN_ACTIVITIES_PATH` can override this directory for direct `uv` usage; relative values are resolved from the project root.
+- The configured SQLite database contains the searchable activity index, track points, saved segment definitions, cached traversals, destination identities/names, and planned routes/notes/collection order. Back it up together with the adjacent `routes/` directory of original uploads. The default `activities.sqlite3`, root `routes/`, and Docker's `storage/` folder are ignored by Git. Ignore custom data locations too if they are inside the repository.
 - `GARMIN_API_KEY` should be kept private and is never written by the application.
 - `.env` is loaded automatically and is ignored by Git.

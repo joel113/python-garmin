@@ -15,6 +15,7 @@ import math
 import threading
 import signal
 import hashlib
+import uuid
 from contextlib import closing
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ from itertools import chain, groupby
 import zipfile
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit, parse_qs, unquote
+from urllib.parse import urlsplit, parse_qs, unquote, quote
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -30,7 +31,7 @@ import fitparse
 import folium
 
 ROOT = Path(__file__).resolve().parent
-ACTIVITIES = ROOT / "activities"
+ACTIVITIES = ROOT / "storage" / "activities"
 DB_PATH = ROOT / "activities.sqlite3"
 PERSONAL_API = "https://personal.connectapi.garmin.com"
 API = PERSONAL_API
@@ -72,6 +73,38 @@ def connect():
         timestamp TEXT, altitude REAL, PRIMARY KEY(activity_id, seq)
       );
       CREATE INDEX IF NOT EXISTS track_activity_idx ON track_points(activity_id, seq);
+      CREATE TABLE IF NOT EXISTS activity_temperature_cache (
+        activity_id TEXT PRIMARY KEY REFERENCES activities(id) ON DELETE CASCADE,
+        file_size INTEGER NOT NULL, file_mtime_ns INTEGER NOT NULL,
+        status TEXT NOT NULL, message TEXT
+      );
+      CREATE TABLE IF NOT EXISTS planned_routes (
+        id TEXT PRIMARY KEY, source_hash TEXT NOT NULL UNIQUE, stored_filename TEXT NOT NULL,
+        original_filename TEXT NOT NULL, name TEXT NOT NULL, sport TEXT NOT NULL DEFAULT 'generic',
+        notes TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 1,
+        distance_m REAL NOT NULL, ascent_m REAL, elevation_coverage REAL NOT NULL,
+        point_count INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS planned_route_points (
+        route_id TEXT NOT NULL REFERENCES planned_routes(id) ON DELETE CASCADE,
+        part INTEGER NOT NULL, seq INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+        elevation REAL, PRIMARY KEY(route_id,part,seq)
+      );
+      CREATE TABLE IF NOT EXISTS planned_route_waypoints (
+        route_id TEXT NOT NULL REFERENCES planned_routes(id) ON DELETE CASCADE,
+        seq INTEGER NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL, name TEXT, description TEXT,
+        PRIMARY KEY(route_id,seq)
+      );
+      CREATE TABLE IF NOT EXISTS route_collections (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS route_collection_members (
+        collection_id TEXT NOT NULL REFERENCES route_collections(id) ON DELETE CASCADE,
+        route_id TEXT NOT NULL REFERENCES planned_routes(id) ON DELETE CASCADE,
+        position INTEGER NOT NULL, PRIMARY KEY(collection_id,route_id), UNIQUE(collection_id,position)
+      );
       CREATE TABLE IF NOT EXISTS segments (
         id INTEGER PRIMARY KEY, name TEXT NOT NULL, sport TEXT NOT NULL,
         radius_m REAL NOT NULL DEFAULT 30, revision INTEGER NOT NULL DEFAULT 1,
@@ -140,6 +173,11 @@ def connect():
       END;
     """)
     db.execute("PRAGMA foreign_keys = ON")
+    if "temperature_c" not in {row[1] for row in db.execute("PRAGMA table_info(track_points)")}:
+        db.execute("BEGIN IMMEDIATE")
+        if "temperature_c" not in {row[1] for row in db.execute("PRAGMA table_info(track_points)")}:
+            db.execute("ALTER TABLE track_points ADD COLUMN temperature_c REAL")
+        db.commit()
     return db
 
 
@@ -229,6 +267,141 @@ def display_segments(rows, stride=1):
     return segments
 
 
+def track_speed_data(rows):
+    """GPS-derived edge speeds in km/h, retaining the display's gap boundaries."""
+    segments, coordinates, speeds, known = [], [], [], []
+    previous = None
+
+    def finish():
+        if len(coordinates) >= 2:
+            segments.append({"points": coordinates, "speeds_kmh": speeds})
+
+    for row in rows:
+        current = (row["lat"], row["lon"], point_time(row["timestamp"]))
+        if previous is None or gps_discontinuity(previous, current):
+            finish()
+            coordinates, speeds = [], []
+        elif coordinates:
+            elapsed = current[2] - previous[2] if current[2] is not None and previous[2] is not None else None
+            value = None
+            if elapsed is not None and 0 < elapsed <= 300:
+                candidate = distance_between(previous, current) / elapsed * 3.6
+                if candidate <= 198:
+                    value = candidate
+                    known.append(value)
+            speeds.append(value)
+        coordinates.append([current[0], current[1]])
+        previous = current
+    finish()
+    known.sort()
+    # Use the 95th percentile so a few GPS spikes do not flatten the color range.
+    if known:
+        position = (len(known) - 1) * 0.95
+        lower, upper = math.floor(position), math.ceil(position)
+        ceiling = known[lower] + (known[upper] - known[lower]) * (position - lower)
+    else:
+        ceiling = None
+    return {"segments": segments, "scale_max_kmh": ceiling,
+            "known_edge_count": len(known), "source": "gps_timestamps"}
+
+
+def temperature_value(value):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def file_temperature_points(path):
+    """Align temperature with GPS-bearing records in the same order as import."""
+    if path.suffix.lower() == ".fit":
+        for record in fitparse.FitFile(str(path)).get_messages("record"):
+            lat, lon = record.get_value("position_lat"), record.get_value("position_long")
+            if lat is not None and lon is not None:
+                yield lat * 180 / 2**31, lon * 180 / 2**31, temperature_value(record.get_value("temperature"))
+    elif path.suffix.lower() == ".gpx":
+        for element in ET.parse(path).getroot().iter():
+            if element.tag.rsplit("}", 1)[-1] not in {"trkpt", "rtept", "wpt"}:
+                continue
+            if element.get("lat") is None or element.get("lon") is None:
+                continue
+            value = next((child.text for child in element.iter() if child.tag.rsplit("}", 1)[-1] == "atemp"), None)
+            yield float(element.get("lat")), float(element.get("lon")), temperature_value(value)
+
+
+def ensure_track_temperature(db, aid):
+    activity = db.execute("SELECT file_path FROM activities WHERE id=?", (aid,)).fetchone()
+    if activity is None:
+        raise SegmentError(404, "Activity not found.")
+    stored_path = Path(activity["file_path"])
+    # Keep old database references usable after moving the originals. Store
+    # portable paths so the same database works on the host and in /data.
+    if stored_path.parent in {Path("activities"), Path("storage/activities")}:
+        path = (ACTIVITIES / stored_path.name).resolve()
+    else:
+        path = (ROOT / stored_path).resolve()
+    if not path.is_relative_to(ACTIVITIES.resolve()) or not path.is_file():
+        if db.execute("SELECT 1 FROM track_points WHERE activity_id=? AND temperature_c IS NOT NULL LIMIT 1", (aid,)).fetchone():
+            return {"status": "loaded", "message": None}
+        return {"status": "unavailable", "message": "The source file is unavailable; recorded temperature cannot be loaded."}
+    fingerprint = (path.stat().st_size, path.stat().st_mtime_ns)
+    cache = db.execute("SELECT * FROM activity_temperature_cache WHERE activity_id=?", (aid,)).fetchone()
+    if cache and (cache["file_size"], cache["file_mtime_ns"]) == fingerprint:
+        return dict(cache)
+    try:
+        readings = list(file_temperature_points(path))
+    except Exception:
+        LOG.exception("Could not read temperature from %s", path.name)
+        return {"status": "unavailable", "message": "Recorded temperature could not be read from the source file."}
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        current = db.execute("SELECT file_path FROM activities WHERE id=?", (aid,)).fetchone()
+        records = db.execute("SELECT seq,lat,lon FROM track_points WHERE activity_id=? ORDER BY seq", (aid,)).fetchall()
+        if (current is None or current["file_path"] != activity["file_path"] or
+            (path.stat().st_size, path.stat().st_mtime_ns) != fingerprint or
+            len(records) != len(readings) or any(abs(row["lat"]-reading[0])>1e-7 or abs(row["lon"]-reading[1])>1e-7 for row, reading in zip(records, readings))):
+            db.rollback()
+            return {"status": "unavailable", "message": "The source file differs from the imported track; reimport this activity to load temperature."}
+        db.executemany("UPDATE track_points SET temperature_c=? WHERE activity_id=? AND seq=?",
+                       [(reading[2], aid, row["seq"]) for row, reading in zip(records, readings)])
+        available = any(reading[2] is not None for reading in readings)
+        status, message = ("loaded", None) if available else ("unavailable", "No recorded temperature data for this track.")
+        db.execute("INSERT OR REPLACE INTO activity_temperature_cache VALUES(?,?,?,?,?)", (aid, *fingerprint, status, message))
+        db.commit()
+        return {"status": status, "message": message}
+    except Exception:
+        db.rollback()
+        raise
+
+
+def track_temperature_data(rows):
+    segments, coordinates, temperatures, known = [], [], [], []
+    previous = None
+
+    def finish():
+        if len(coordinates) >= 2:
+            segments.append({"points": coordinates, "temperatures_c": temperatures})
+
+    for row in rows:
+        current = (row["lat"], row["lon"], point_time(row["timestamp"]), temperature_value(row["temperature_c"]))
+        if previous is None or gps_discontinuity(previous, current):
+            finish()
+            coordinates, temperatures = [], []
+        elif coordinates:
+            readings = [v for v in (previous[3], current[3]) if v is not None]
+            value = sum(readings)/len(readings) if readings else None
+            temperatures.append(value)
+            if value is not None:
+                known.append(value)
+        coordinates.append([current[0], current[1]])
+        previous = current
+    finish()
+    return {"segments": segments, "scale_min_c": min(known) if known else None,
+            "scale_max_c": max(known) if known else None, "known_edge_count": len(known),
+            "source": "recorded_temperature"}
+
+
 def import_file(db: sqlite3.Connection, path: Path) -> bool:
     aid = activity_id(path)
     try:
@@ -245,6 +418,8 @@ def import_file(db: sqlite3.Connection, path: Path) -> bool:
             meta = {"start_time": start_time, "sport": "gpx", "duration_s": duration, "distance_m": distance}
             points = [(aid, seq, lat, lon, timestamp, altitude)
                       for seq, (lat, lon, timestamp, altitude) in enumerate(raw_points)]
+            readings = list(file_temperature_points(path))
+            points = [(*p, readings[index][2]) for index, p in enumerate(points)]
         else:
             fit = fitparse.FitFile(str(path))
             session = next(iter(fit.get_messages("session")), None)
@@ -260,12 +435,17 @@ def import_file(db: sqlite3.Connection, path: Path) -> bool:
                 if lat is None or lon is None:
                     continue
                 points.append((aid, len(points), lat * 180 / 2**31, lon * 180 / 2**31,
-                               str(record.get_value("timestamp") or ""), record.get_value("altitude")))
+                               str(record.get_value("timestamp") or ""), record.get_value("altitude"),
+                               temperature_value(record.get_value("temperature"))))
         old = db.execute("SELECT sport FROM activities WHERE id=?", (aid,)).fetchone()
         db.execute("DELETE FROM activities WHERE id=?", (aid,))
         db.execute("INSERT INTO activities(id,file_path,start_time,sport,duration_s,distance_m) VALUES(?,?,?,?,?,?)",
-                   (aid, str(path.relative_to(ROOT)), str(meta["start_time"] or ""), meta["sport"], meta["duration_s"], meta["distance_m"]))
-        db.executemany("INSERT INTO track_points(activity_id,seq,lat,lon,timestamp,altitude) VALUES(?,?,?,?,?,?)", points)
+                   (aid, str(Path("storage/activities") / path.name), str(meta["start_time"] or ""), meta["sport"], meta["duration_s"], meta["distance_m"]))
+        db.executemany("INSERT INTO track_points(activity_id,seq,lat,lon,timestamp,altitude,temperature_c) VALUES(?,?,?,?,?,?,?)", points)
+        available = any(p[6] is not None for p in points)
+        db.execute("INSERT INTO activity_temperature_cache VALUES(?,?,?,?,?)",
+                   (aid, path.stat().st_size, path.stat().st_mtime_ns, "loaded" if available else "unavailable",
+                    None if available else "No recorded temperature data for this track."))
         if points:
             db.execute("INSERT INTO activity_bounds VALUES(?,?,?,?,?)", (aid,
                        min(p[2] for p in points), max(p[2] for p in points),
@@ -281,7 +461,7 @@ def import_file(db: sqlite3.Connection, path: Path) -> bool:
 
 
 def import_all():
-    ACTIVITIES.mkdir(exist_ok=True)
+    ACTIVITIES.mkdir(parents=True, exist_ok=True)
     db = connect()
     ok = sum(import_file(db, p) for p in activity_files())
     db.close()
@@ -372,6 +552,7 @@ def fetch_new():
     key = os.environ.get("GARMIN_API_KEY")
     if not key:
         sys.exit("Set GARMIN_API_KEY in your environment first.")
+    ACTIVITIES.mkdir(parents=True, exist_ok=True)
     token_data = api_request(PERSONAL_API + "/personalapitoken-service/personal-api/personal-api-key/token", key, "POST", auth_scheme="ApiKey")
     # Garmin's token endpoint returns the bearer JWT as plain text, not JSON.
     token = token_data.decode("utf-8").strip()
@@ -895,6 +1076,210 @@ def track_segment_results(db, aid):
     return result
 
 
+ROUTE_UPLOAD_LIMIT = 25 * 1024 * 1024
+ROUTE_POINT_LIMIT = 200_000
+
+
+def route_storage_dir():
+    return DB_PATH.parent / "routes"
+
+
+def parse_planned_gpx(content, filename):
+    from defusedxml import ElementTree as safe_xml
+    from defusedxml.common import DefusedXmlException
+
+    try:
+        root = safe_xml.fromstring(content, forbid_dtd=True, forbid_entities=True, forbid_external=True)
+    except (ET.ParseError, DefusedXmlException, ValueError):
+        raise SegmentError(400, "The upload must be a valid GPX file without DTDs or entities.")
+    if root.tag.rsplit("}", 1)[-1] != "gpx" or root.get("version", "1.1") not in {"1.0", "1.1"}:
+        raise SegmentError(400, "Only GPX 1.0 and 1.1 files are supported.")
+
+    def children(element, tag):
+        return [child for child in element if child.tag.rsplit("}", 1)[-1] == tag]
+
+    def text(element, tag):
+        matches = children(element, tag)
+        return (matches[0].text or "").strip() if matches else ""
+
+    count = 0
+
+    def point(element):
+        nonlocal count
+        count += 1
+        if count > ROUTE_POINT_LIMIT:
+            raise SegmentError(413, "A route can contain at most 200,000 points, including waypoints.")
+        try:
+            lat, lon = float(element.get("lat")), float(element.get("lon"))
+            if not math.isfinite(lat) or not math.isfinite(lon) or not -90 <= lat <= 90 or not -180 <= lon <= 180:
+                raise ValueError()
+        except (TypeError, ValueError):
+            raise SegmentError(400, "Every route point must have valid latitude and longitude coordinates.")
+        elevation = temperature_value(text(element, "ele"))
+        if elevation is not None and abs(elevation) > 1_000_000:
+            raise SegmentError(400, "Elevation values must be realistic finite metre values.")
+        return (lat, lon, elevation)
+
+    parts, waypoints, names, types = [], [], [text(root, "name")], []
+    metadata = children(root, "metadata")
+    if metadata:
+        names.append(text(metadata[0], "name"))
+    for element in root:
+        tag = element.tag.rsplit("}", 1)[-1]
+        if tag == "trk":
+            names.append(text(element, "name"))
+            types.append(text(element, "type"))
+            for segment in children(element, "trkseg"):
+                points = [point(p) for p in children(segment, "trkpt")]
+                if points:
+                    parts.append(points)
+        elif tag == "rte":
+            names.append(text(element, "name"))
+            types.append(text(element, "type"))
+            points = [point(p) for p in children(element, "rtept")]
+            if points:
+                parts.append(points)
+        elif tag == "wpt":
+            lat, lon, _ = point(element)
+            waypoints.append((lat, lon, text(element, "name")[:200], text(element, "desc")[:2000]))
+    if not any(len(part) >= 2 for part in parts):
+        raise SegmentError(400, "The GPX must contain a track or route with at least two points; waypoints alone are not a route.")
+    distance, ascent, elevation_pairs = 0.0, 0.0, 0
+    for part in parts:
+        for a, b in zip(part, part[1:]):
+            distance += distance_between(a, b)
+            if a[2] is not None and b[2] is not None:
+                elevation_pairs += 1
+                ascent += max(0, b[2] - a[2])
+    points = sum(len(part) for part in parts)
+    covered = sum(p[2] is not None for part in parts for p in part)
+    return {"name": next((name for name in names if name), Path(filename).stem or "Planned route")[:120],
+            "sport": next((value for value in types if value and not value.isdigit()), "generic")[:80],
+            "parts": parts, "waypoints": waypoints, "distance_m": distance,
+            "ascent_m": ascent if elevation_pairs else None, "elevation_coverage": covered / points,
+            "point_count": points}
+
+
+def collection_detail(db, cid):
+    row = db.execute("""SELECT c.*,COUNT(m.route_id) AS route_count,COALESCE(SUM(r.distance_m),0) AS distance_m
+        FROM route_collections c LEFT JOIN route_collection_members m ON m.collection_id=c.id
+        LEFT JOIN planned_routes r ON r.id=m.route_id WHERE c.id=? GROUP BY c.id""", (cid,)).fetchone()
+    if row is None:
+        raise SegmentError(404, "Collection not found.")
+    return dict(row)
+
+
+def route_memberships(db):
+    result = {}
+    for row in db.execute("""SELECT m.route_id,c.id,c.name,m.position FROM route_collection_members m
+        JOIN route_collections c ON c.id=m.collection_id ORDER BY c.name,c.id"""):
+        result.setdefault(row["route_id"], []).append({"id": row["id"], "name": row["name"], "position": row["position"]})
+    return result
+
+
+def route_list(db, cid=None):
+    memberships = route_memberships(db)
+    columns = "r.id,r.name,r.sport,r.distance_m,r.ascent_m,r.elevation_coverage,r.point_count,r.revision,r.created_at,r.updated_at,r.original_filename"
+    if cid:
+        collection_detail(db, cid)
+        rows = db.execute(f"""SELECT {columns},m.position FROM planned_routes r
+            JOIN route_collection_members m ON m.route_id=r.id WHERE m.collection_id=? ORDER BY m.position""", (cid,))
+    else:
+        rows = db.execute(f"SELECT {columns} FROM planned_routes r ORDER BY r.created_at DESC,r.rowid DESC")
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["collections"] = memberships.get(row["id"], [])
+        result.append(item)
+    return result
+
+
+def planned_route_detail(db, rid):
+    row = db.execute("SELECT * FROM planned_routes WHERE id=?", (rid,)).fetchone()
+    if row is None:
+        raise SegmentError(404, "Route not found.")
+    result = dict(row)
+    result.pop("stored_filename")
+    result.pop("source_hash")
+    result["collections"] = route_memberships(db).get(rid, [])
+    return result
+
+
+def collection_order(db, cid, ids):
+    # Move positions out of the positive range before assigning their new values.
+    db.execute("UPDATE route_collection_members SET position=-position WHERE collection_id=?", (cid,))
+    db.executemany("UPDATE route_collection_members SET position=? WHERE collection_id=? AND route_id=?",
+                   [(index, cid, rid) for index, rid in enumerate(ids, 1)])
+    db.execute("UPDATE route_collections SET revision=revision+1 WHERE id=?", (cid,))
+
+
+def attach_route(db, cid, rid):
+    collection_detail(db, cid)
+    if db.execute("SELECT 1 FROM route_collection_members WHERE collection_id=? AND route_id=?", (cid, rid)).fetchone():
+        return False
+    position = db.execute("SELECT COALESCE(MAX(position),0)+1 FROM route_collection_members WHERE collection_id=?", (cid,)).fetchone()[0]
+    db.execute("INSERT INTO route_collection_members VALUES(?,?,?)", (cid, rid, position))
+    db.execute("UPDATE route_collections SET revision=revision+1 WHERE id=?", (cid,))
+    return True
+
+
+def store_planned_route(db, content, filename, cid=None):
+    if not filename.lower().endswith(".gpx"):
+        raise SegmentError(400, "Choose a .gpx file.")
+    parsed = parse_planned_gpx(content, filename)
+    digest = hashlib.sha256(content).hexdigest()
+    created_path = None
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if cid:
+            collection_detail(db, cid)
+        existing = db.execute("SELECT id FROM planned_routes WHERE source_hash=?", (digest,)).fetchone()
+        if existing:
+            rid, duplicate = existing["id"], True
+        else:
+            rid, duplicate = str(uuid.uuid4()), False
+            folder = route_storage_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / (rid + ".gpx")
+            with path.open("xb") as stream:
+                created_path = path
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            db.execute("""INSERT INTO planned_routes(id,source_hash,stored_filename,original_filename,name,sport,
+                distance_m,ascent_m,elevation_coverage,point_count) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (rid, digest, path.name, filename, parsed["name"], parsed["sport"], parsed["distance_m"],
+                 parsed["ascent_m"], parsed["elevation_coverage"], parsed["point_count"]))
+            db.executemany("INSERT INTO planned_route_points VALUES(?,?,?,?,?,?)",
+                           [(rid, part_index, seq, *point) for part_index, part in enumerate(parsed["parts"]) for seq, point in enumerate(part)])
+            db.executemany("INSERT INTO planned_route_waypoints VALUES(?,?,?,?,?,?)",
+                           [(rid, seq, *point) for seq, point in enumerate(parsed["waypoints"])])
+        attached = attach_route(db, cid, rid) if cid else False
+        result = {"route": planned_route_detail(db, rid), "duplicate": duplicate, "attached": attached}
+        db.commit()
+        return result
+    except Exception:
+        db.rollback()
+        if created_path is not None:
+            created_path.unlink(missing_ok=True)
+        raise
+
+
+def planned_route_geometry(db, rid, preview=False):
+    route = planned_route_detail(db, rid)
+    stride = max(1, math.ceil(route["point_count"] / 20_000)) if preview else 1
+    parts = []
+    rows = db.execute("SELECT * FROM planned_route_points WHERE route_id=? ORDER BY part,seq", (rid,))
+    for _, group in groupby(rows, key=lambda row: row["part"]):
+        points = [[row["lat"], row["lon"]] for row in group]
+        sampled = points[::stride]
+        if sampled[-1] != points[-1]:
+            sampled.append(points[-1])
+        parts.append(sampled)
+    waypoints = [dict(row) for row in db.execute("SELECT seq,lat,lon,name,description FROM planned_route_waypoints WHERE route_id=? ORDER BY seq", (rid,))]
+    return {"id": rid, "parts": parts, "waypoints": waypoints, "sampled": stride > 1}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT / "web"), **kwargs)
@@ -905,6 +1290,8 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
+        if urlsplit(self.path).path.startswith(("/api/routes", "/api/route-collections")):
+            return self.routes_request("GET")
         if urlsplit(self.path).path.startswith("/api/destinations"):
             return self.destination_request("GET")
         if urlsplit(self.path).path.startswith("/api/segments"):
@@ -942,9 +1329,22 @@ class Handler(SimpleHTTPRequestHandler):
             aid = unquote(parts[2])
             try:
                 with closing(connect()) as db:
+                    if len(parts) == 4 and parts[3] == "temperature":
+                        availability = ensure_track_temperature(db, aid)
+                        db.execute("BEGIN")
+                        result = track_temperature_data(db.execute(
+                            "SELECT lat,lon,timestamp,temperature_c FROM track_points WHERE activity_id=? ORDER BY seq", (aid,)))
+                        result["availability"] = availability["status"]
+                        result["message"] = availability.get("message")
+                        return self.send_json(result)
                     db.execute("BEGIN")
                     if len(parts) == 4 and parts[3] == "segments":
                         return self.send_json(track_segment_results(db, aid))
+                    if len(parts) == 4 and parts[3] == "speed":
+                        if not db.execute("SELECT 1 FROM activities WHERE id=?", (aid,)).fetchone():
+                            raise SegmentError(404, "Activity not found.")
+                        return self.send_json(track_speed_data(db.execute(
+                            "SELECT lat,lon,timestamp FROM track_points WHERE activity_id=? ORDER BY seq", (aid,))))
                     if len(parts) != 3:
                         raise SegmentError(404, "API endpoint not found.")
                     segments = display_segments(db.execute("SELECT lat,lon,timestamp FROM track_points WHERE activity_id=? ORDER BY seq", (aid,)))
@@ -968,11 +1368,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.mutation_request("DELETE")
 
     def mutation_request(self, method):
+        if urlsplit(self.path).path.startswith(("/api/routes", "/api/route-collections")):
+            return self.routes_request(method)
         if urlsplit(self.path).path.startswith("/api/destinations"):
             return self.destination_request(method)
         return self.segment_request(method)
 
-    def mutation_payload(self):
+    def require_same_origin(self):
         host = self.headers.get("Host", "").lower()
         configured_hosts = os.environ.get("GARMIN_ALLOWED_HOSTS", "")
         allowed = {value.strip().lower() for value in configured_hosts.split(",") if value.strip()}
@@ -982,18 +1384,183 @@ class Handler(SimpleHTTPRequestHandler):
         if (host not in allowed or self.headers.get("Sec-Fetch-Site") == "cross-site" or
             (origin is not None and origin != f"http://{host}")):
             raise SegmentError(403, "Only same-origin requests are allowed.")
+
+    def mutation_payload(self, maximum=65536):
+        self.require_same_origin()
         if self.headers.get_content_type() != "application/json":
             raise SegmentError(415, "Send an application/json request.")
         try:
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size <= 65536:
+            if not 0 < size <= maximum:
                 raise ValueError()
             payload = json.loads(self.rfile.read(size))
         except (ValueError, UnicodeDecodeError):
-            raise SegmentError(400, "Invalid JSON request (maximum 64 KB).")
+            raise SegmentError(400, f"Invalid JSON request (maximum {maximum // 1024} KB).")
         if not isinstance(payload, dict):
             raise SegmentError(400, "Expected a JSON object.")
         return payload
+
+    def send_download(self, data, filename, content_type):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(filename, safe=""))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def routes_request(self, method):
+        try:
+            parsed = urlsplit(self.path)
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) < 2 or parts[0] != "api" or parts[1] not in {"routes", "route-collections"}:
+                raise SegmentError(404, "API endpoint not found.")
+            query = parse_qs(parsed.query)
+            upload = parts == ["api", "routes", "upload"] and method == "POST"
+            payload = {}
+            if upload:
+                self.require_same_origin()
+                if self.headers.get_content_type() != "application/gpx+xml":
+                    raise SegmentError(415, "Upload the GPX as application/gpx+xml.")
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    raise SegmentError(400, "Invalid upload size.")
+                if not 0 < length <= ROUTE_UPLOAD_LIMIT:
+                    raise SegmentError(413, "Choose a nonempty GPX file no larger than 25 MiB.")
+                self.connection.settimeout(60)
+                content = self.rfile.read(length)
+                if len(content) != length:
+                    raise SegmentError(400, "The GPX upload was incomplete.")
+                filename = query.get("filename", ["route.gpx"])[0].replace(chr(92), "/").rsplit("/", 1)[-1]
+                if len(filename) > 255:
+                    raise SegmentError(400, "The filename must have at most 255 characters.")
+            elif method != "GET":
+                payload = self.mutation_payload(maximum=131072)
+            with closing(connect()) as db:
+                if upload:
+                    result = store_planned_route(db, content, filename, query.get("collection_id", [None])[0])
+                    return self.send_json(result, 200 if result["duplicate"] else 201)
+                if method == "GET":
+                    db.execute("BEGIN")
+                if parts[1] == "route-collections":
+                    if len(parts) == 2:
+                        if method == "GET":
+                            ids = [r[0] for r in db.execute("SELECT id FROM route_collections ORDER BY name,id")]
+                            return self.send_json([collection_detail(db, cid) for cid in ids])
+                        if method != "POST":
+                            raise SegmentError(405, "Method not allowed.")
+                        name = payload.get("name")
+                        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 120:
+                            raise SegmentError(400, "Enter a collection name of 1–120 characters.")
+                        cid = str(uuid.uuid4())
+                        db.execute("INSERT INTO route_collections(id,name) VALUES(?,?)", (cid, name.strip()))
+                        db.commit()
+                        return self.send_json(collection_detail(db, cid), 201)
+                    cid = unquote(parts[2])
+                    if method != "GET":
+                        db.execute("BEGIN IMMEDIATE")
+                    collection = collection_detail(db, cid)
+                    if method != "GET" and payload.get("revision") != collection["revision"]:
+                        raise SegmentError(409, "This collection changed. Refresh it before trying again.")
+                    if len(parts) == 3:
+                        if method == "GET":
+                            return self.send_json(collection)
+                        if method == "PUT":
+                            name = payload.get("name")
+                            if not isinstance(name, str) or not 1 <= len(name.strip()) <= 120:
+                                raise SegmentError(400, "Enter a collection name of 1–120 characters.")
+                            db.execute("UPDATE route_collections SET name=?,revision=revision+1 WHERE id=?", (name.strip(), cid))
+                            db.commit()
+                            return self.send_json(collection_detail(db, cid))
+                        if method == "DELETE":
+                            db.execute("DELETE FROM route_collections WHERE id=?", (cid,))
+                            db.commit()
+                            return self.send_json({"deleted": True})
+                    elif parts[3:] == ["order"] and method == "PUT":
+                        ids = payload.get("route_ids")
+                        if not isinstance(ids, list) or any(not isinstance(rid, str) for rid in ids):
+                            raise SegmentError(400, "Provide the ordered route IDs.")
+                        current = [r[0] for r in db.execute("SELECT route_id FROM route_collection_members WHERE collection_id=? ORDER BY position", (cid,))]
+                        if len(ids) != len(current) or set(ids) != set(current):
+                            raise SegmentError(409, "The collection membership changed. Refresh it and reorder again.")
+                        collection_order(db, cid, ids)
+                        db.commit()
+                        return self.send_json(collection_detail(db, cid))
+                    elif parts[3:] == ["members"] and method == "POST":
+                        rid = payload.get("route_id")
+                        if not isinstance(rid, str):
+                            raise SegmentError(400, "Choose a route to add.")
+                        planned_route_detail(db, rid)
+                        attach_route(db, cid, rid)
+                        db.commit()
+                        return self.send_json(collection_detail(db, cid))
+                    elif len(parts) == 5 and parts[3] == "members" and method == "DELETE":
+                        rid = unquote(parts[4])
+                        db.execute("DELETE FROM route_collection_members WHERE collection_id=? AND route_id=?", (cid, rid))
+                        ids = [r[0] for r in db.execute("SELECT route_id FROM route_collection_members WHERE collection_id=? ORDER BY position", (cid,))]
+                        collection_order(db, cid, ids)
+                        db.commit()
+                        return self.send_json(collection_detail(db, cid))
+                    raise SegmentError(405, "Method not allowed.")
+                if len(parts) == 2:
+                    if method != "GET":
+                        raise SegmentError(405, "Use the GPX upload endpoint to create routes.")
+                    cid = query.get("collection_id", [None])[0]
+                    return self.send_json({"routes": route_list(db, cid), "collection": collection_detail(db, cid) if cid else None})
+                rid = unquote(parts[2])
+                if method != "GET":
+                    db.execute("BEGIN IMMEDIATE")
+                route = planned_route_detail(db, rid)
+                if len(parts) == 3:
+                    if method == "GET":
+                        return self.send_json(route)
+                    if payload.get("revision") != route["revision"]:
+                        raise SegmentError(409, "This route changed. Reload it before saving.")
+                    if method == "PUT":
+                        name, sport, notes = payload.get("name"), payload.get("sport"), payload.get("notes")
+                        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 120:
+                            raise SegmentError(400, "Enter a route name of 1–120 characters.")
+                        if not isinstance(sport, str) or not 1 <= len(sport.strip()) <= 80:
+                            raise SegmentError(400, "Enter a sport of 1–80 characters.")
+                        if not isinstance(notes, str) or len(notes) > 20000:
+                            raise SegmentError(400, "Notes must contain at most 20,000 characters.")
+                        db.execute("""UPDATE planned_routes SET name=?,sport=?,notes=?,revision=revision+1,
+                            updated_at=CURRENT_TIMESTAMP WHERE id=?""", (name.strip(), sport.strip(), notes, rid))
+                        db.commit()
+                        return self.send_json(planned_route_detail(db, rid))
+                    if method == "DELETE":
+                        filename = db.execute("SELECT stored_filename FROM planned_routes WHERE id=?", (rid,)).fetchone()[0]
+                        collections = [r[0] for r in db.execute("SELECT collection_id FROM route_collection_members WHERE route_id=?", (rid,))]
+                        db.execute("DELETE FROM planned_routes WHERE id=?", (rid,))
+                        for cid in collections:
+                            ids = [r[0] for r in db.execute("SELECT route_id FROM route_collection_members WHERE collection_id=? ORDER BY position", (cid,))]
+                            collection_order(db, cid, ids)
+                        db.commit()
+                        path = (route_storage_dir() / filename).resolve()
+                        if path.is_relative_to(route_storage_dir().resolve()):
+                            try:
+                                path.unlink(missing_ok=True)
+                            except OSError:
+                                LOG.warning("Could not remove orphaned route file %s", filename)
+                        return self.send_json({"deleted": True})
+                if method == "GET" and parts[3:] == ["geometry"]:
+                    return self.send_json(planned_route_geometry(db, rid, query.get("preview") == ["1"]))
+                if method == "GET" and parts[3:] == ["download"]:
+                    filename = db.execute("SELECT stored_filename FROM planned_routes WHERE id=?", (rid,)).fetchone()[0]
+                    path = (route_storage_dir() / filename).resolve()
+                    if not path.is_relative_to(route_storage_dir().resolve()) or not path.is_file():
+                        raise SegmentError(404, "The original GPX file is unavailable.")
+                    return self.send_download(path.read_bytes(), route["original_filename"], "application/gpx+xml")
+                if method == "GET" and parts[3:] == ["notes"]:
+                    return self.send_download((route["name"] + "\n\n" + route["notes"]).encode("utf-8"),
+                                              route["name"] + "-notes.txt", "text/plain; charset=utf-8")
+                raise SegmentError(405, "Method not allowed.")
+        except SegmentError as exc:
+            self.send_json({"error": exc.message}, exc.status)
+        except Exception:
+            LOG.exception("Routes API request failed")
+            self.send_json({"error": "The route request could not be completed. Please retry."}, 500)
 
     def destination_request(self, method):
         try:
@@ -1184,13 +1751,15 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    global DB_PATH
+    global DB_PATH, ACTIVITIES
     load_dotenv()
     configured_db = Path(os.environ.get("GARMIN_DB_PATH") or ROOT / "activities.sqlite3").expanduser()
     DB_PATH = configured_db if configured_db.is_absolute() else ROOT / configured_db
+    configured_activities = Path(os.environ.get("GARMIN_ACTIVITIES_PATH") or ROOT / "storage/activities").expanduser()
+    ACTIVITIES = configured_activities if configured_activities.is_absolute() else ROOT / configured_activities
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("import", help="Import FIT files from activities/")
+    sub.add_parser("import", help="Import FIT/GPX files from storage/activities/ (or GARMIN_ACTIVITIES_PATH)")
     sub.add_parser("fetch", help="Fetch new Garmin activities (requires GARMIN_API_KEY)")
     sub.add_parser("export-csv", help="Export session metadata to analysis/activities.csv")
     sub.add_parser("export-map", help="Export a static Folium map to analysis/activities_map.html")
