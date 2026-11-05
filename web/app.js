@@ -196,6 +196,7 @@ async function showTrack(id) {
   try {
     const map=getMap("map");
     ensureTrackSegmentPanes();
+    if(window.routeMatchUI) window.routeMatchUI.show("track",id,map);
     loadTrackSegments(id,version);
     if (layers.track) { map.removeLayer(layers.track); layers.track=null; }
     const points=await getJSON("/api/track/"+encodeURIComponent(id));
@@ -438,6 +439,7 @@ function switchView(view) {
   if(window.routesUI && view!=="routes") window.routesUI.hide();
   if(window.destinationUI && view!=="destinations") window.destinationUI.hide();
   clearTimeout(trackSegmentPoll);
+  if(window.routeMatchUI) window.routeMatchUI.hideExcept(view);
   document.querySelectorAll(".view").forEach(section=>section.hidden=section.id!==view);
   document.querySelectorAll("[data-view]").forEach(button=>{if(button.dataset.view===view) button.setAttribute("aria-current","page"); else button.removeAttribute("aria-current");});
   requestAnimationFrame(()=>{
@@ -449,7 +451,10 @@ function switchView(view) {
       if (view==="tracks") {
         getMap("map");
         if (!selected) { const first=activities.find(a=>a.has_track); if (first) showTrack(first.id); }
-        else loadTrackSegments(selected,trackVersion);
+        else {
+          loadTrackSegments(selected,trackVersion);
+          if(window.routeMatchUI) window.routeMatchUI.show("track",selected,getMap("map"));
+        }
       }
     } catch(error) { report(error); }
   });

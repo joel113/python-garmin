@@ -79,7 +79,7 @@ window.routesUI=(()=>{
       if(token!==version||!active())return;
       collections=result[0];rows=result[1].routes;collection=result[1].collection;
       renderCollections();renderList();
-      if(selectedId&&!rows.some(r=>r.id===selectedId)&&!dirty){selectedId=null;detail=null;selectionVersion++;selectedLayer.clearLayers();$("#routes-detail").hidden=true;$(".routes-sidebar").classList.remove("has-selection");}
+      if(selectedId&&!rows.some(r=>r.id===selectedId)&&!dirty){selectedId=null;detail=null;selectionVersion++;selectedLayer.clearLayers();if(window.routeMatchUI)window.routeMatchUI.clear("route");$("#routes-detail").hidden=true;$(".routes-sidebar").classList.remove("has-selection");}
       if(!selectedId&&rows.length&&!dirty)selectedId=rows[0].id;
       status(rows.length+" planned route"+(rows.length===1?"":"s")+(collection?" in "+collection.name:" in the library")+".");
       drawOverview(fit);
@@ -162,6 +162,7 @@ window.routesUI=(()=>{
       $("#routes-download").href="/api/routes/"+encodeURIComponent(id)+"/download";
       $("#routes-notes-download").href="/api/routes/"+encodeURIComponent(id)+"/notes";
       renderMemberships();selectedLayer.clearLayers();
+      if(window.routeMatchUI) window.routeMatchUI.show("route",id,map);
       const index=rows.findIndex(r=>r.id===id),color=palette[Math.max(0,index)%palette.length];
       L.polyline(data.parts,{pane:"planned-route-selection",color:"#fff",weight:8,opacity:1,interactive:false}).addTo(selectedLayer);
       const line=L.polyline(data.parts,{pane:"planned-route-selection",color,weight:5,opacity:1}).addTo(selectedLayer);
@@ -240,13 +241,14 @@ window.routesUI=(()=>{
   };
   $("#routes-delete-route").onclick=async()=>{
     if(!detail||!allowChange()||!confirm('Delete "'+detail.name+'" from the library, including its original file, notes, and all collection memberships?'))return;setBusy(true);
-    try {await request("routes/"+detail.id,"DELETE",{revision:detail.revision});selectedId=null;detail=null;$("#routes-detail").hidden=true;selectedLayer.clearLayers();$(".routes-sidebar").classList.remove("has-selection");await refresh(false);}
+    try {await request("routes/"+detail.id,"DELETE",{revision:detail.revision});selectedId=null;detail=null;if(window.routeMatchUI)window.routeMatchUI.clear("route");$("#routes-detail").hidden=true;selectedLayer.clearLayers();$(".routes-sidebar").classList.remove("has-selection");await refresh(false);}
     catch(error){status(error.message);}finally{setBusy(false);}
   };
   $("#routes-focus").onclick=()=>{if(map&&selectedLayer.getBounds().isValid())map.fitBounds(selectedLayer.getBounds(),{padding:[30,30],maxZoom:16});};
   $("#routes-show-collection").onchange=()=>drawOverview(true);
   $("#routes-fit-all").onclick=()=>{if(overviewLayer.getBounds().isValid())map.fitBounds(overviewLayer.getBounds(),{padding:[30,30],maxZoom:14});};
   return {
+    async openRoute(id){if(!allowChange())return;initMap();collectionId="";selectedId=id;await refresh(true);},
     async show(){try{initMap();await refresh(true);}catch(error){status(error.message);}},
     hide(){version++;selectionVersion++;mapVersion++;},
     allowNavigate(view){return view==="routes"||allowChange();}
