@@ -1,9 +1,10 @@
-"""Synthetic route-matching scenarios. Not executed during implementation."""
+"""Synthetic route alignment and SQLite lifecycle scenarios."""
 import threading
 import unittest
 
-from app import (classify_route_match, matching_samples, ordered_route_alignment,
-                 matching_ranges, display_segments)
+from garmin_library.route_matching import (classify_route_match, matching_samples,
+    ordered_route_alignment, matching_ranges)
+from garmin_library.geometry import display_segments
 
 
 def line(start, end, spacing=10, latitude=48):
@@ -88,16 +89,14 @@ class RouteMatchingTests(unittest.TestCase):
 
 class RouteMatchingPersistenceTests(unittest.TestCase):
     def setUp(self):
-        import app
+        from garmin_library.context import AppContext
+        from garmin_library.config import Settings
         import tempfile
         from pathlib import Path
-        from unittest.mock import patch
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.patch = patch.object(app, "DB_PATH", Path(self.directory.name)/"library.sqlite3")
-        self.patch.start()
-        self.addCleanup(self.patch.stop)
-        self.db = app.connect()
+        self.context = AppContext(Settings.from_environment({}, root=Path(self.directory.name)))
+        self.db = self.context.connect()
         self.addCleanup(self.db.close)
         self.db.execute("INSERT INTO activities(id,file_path,sport) VALUES('track','storage/activities/track.fit','cycling')")
         self.db.execute("""INSERT INTO planned_routes(id,source_hash,stored_filename,original_filename,name,distance_m,elevation_coverage,point_count)
@@ -139,7 +138,7 @@ class RouteMatchingPersistenceTests(unittest.TestCase):
 
 
     def test_both_views_return_the_same_classification_and_coverage(self):
-        from app import route_match_results
+        from garmin_library.route_matching import route_match_results
         self.cache()
         route_result = route_match_results(self.db, "route", "route", {})["matches"][0]
         track_result = route_match_results(self.db, "activity", "track", {})["matches"][0]
@@ -147,11 +146,12 @@ class RouteMatchingPersistenceTests(unittest.TestCase):
             self.assertEqual(route_result[key], track_result[key])
 
     def test_old_geometry_is_withheld_after_input_changes(self):
-        from app import route_match_geometry, SegmentError
+        from garmin_library.route_matching import route_match_geometry
+        from garmin_library.errors import AppError
         self.cache()
         self.db.execute("INSERT INTO activities(id,file_path) VALUES('new','storage/activities/new.fit')")
         self.db.commit()
-        with self.assertRaises(SegmentError) as error:
+        with self.assertRaises(AppError) as error:
             route_match_geometry(self.db, "route", "track")
         self.assertEqual(error.exception.status, 409)
 

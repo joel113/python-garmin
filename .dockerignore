@@ -5,5 +5,9 @@
 !uv.lock
 !README.md
 !app.py
+!garmin_library/
+!garmin_library/**
 !web/
 !web/**
+**/__pycache__/
+**/*.pyc

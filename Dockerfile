@@ -20,6 +20,7 @@ RUN groupadd --gid 1000 app \
     && chown -R app:app /data /app/analysis
 
 COPY app.py ./
+COPY garmin_library/ ./garmin_library/
 COPY web/ ./web/
 
 USER app

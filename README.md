@@ -132,7 +132,7 @@ Matching samples continuous paths at intervals of at most 20 m and uses spatial 
 
 A background worker runs with the single app server. Route uploads, activity imports/replacements/deletions, and settings changes queue recalculation; editing route notes, names, sports, or collection order does not. SQLite caches results and matched ranges, protected by source/settings revisions. Previous results remain listed as updating, but outdated map geometry is withheld until recalculation finishes. Views refresh automatically; failed jobs offer **Retry matching**, and interrupted jobs resume on server startup. Back up the database to preserve matching settings; cached matches can be recalculated.
 
-Synthetic algorithm and SQLite lifecycle scenarios are provided in `tests/test_route_matching.py`; they were not run during implementation, following project instructions. Additional acceptance scenarios for an explicitly authorized verification session are: concurrent imports/settings changes must prevent stale publication; restarting during processing must resume work; both views must show identical metrics; pagination, counterpart navigation, unsaved route edits, map toggles/zoom, and simultaneous segment/speed/temperature overlays must work together. Verify source files, segment definitions, destination identities, and route notes remain intact after recalculation.
+Synthetic algorithm and SQLite lifecycle scenarios are provided in `tests/test_route_matching.py`. The backend refactor also includes configuration, CLI/import/export, HTTP compatibility/security, mocked Garmin, and worker lifecycle tests. Additional acceptance scenarios for an explicitly authorized verification session are: concurrent imports/settings changes must prevent stale publication; restarting during processing must resume work; both views must show identical metrics; pagination, counterpart navigation, unsaved route edits, map toggles/zoom, and simultaneous segment/speed/temperature overlays must work together. Verify source files, segment definitions, destination identities, and route notes remain intact after recalculation.
 
 ## Run with Docker Compose
 
@@ -278,6 +278,29 @@ uv run python app.py export-map
 ```
 
 These commands write `analysis/activities.csv` and `analysis/activities_map.html` respectively.
+
+## Backend organization and development
+
+`app.py` remains the CLI entry point, so all commands above are unchanged. Backend code lives in the `garmin_library` package:
+
+| Modules | Responsibility |
+| --- | --- |
+| `config`, `context`, `database`, `errors` | Immutable settings, explicit application dependencies, SQLite setup/upgrades, shared errors |
+| `geometry` | Coordinates, timestamps, and GPS discontinuities |
+| `activities`, `garmin`, `exports` | FIT/GPX parsing and imports, paced Garmin downloads, generated analysis files |
+| `segments`, `destinations`, `routes`, `route_matching` | Feature logic, feature SQL, and background processing |
+| `http` | Shared HTTP transport/security and separate feature endpoint modules |
+| `server`, `cli` | Server and worker lifecycle, argument parsing, and command dispatch |
+
+Shared infrastructure does not import feature modules; features do not import HTTP or CLI code. Configuration is passed through an `AppContext` rather than mutable path globals, and each request or worker opens its own SQLite connection. Importing the package does not load `.env`, create a database, start workers, or contact Garmin. CLI startup loads `.env` with existing environment values taking precedence. Tests construct settings explicitly so temporary libraries remain isolated from personal storage.
+
+When verification is explicitly authorized, run the focused suite with:
+
+```bash
+uv run python -m unittest discover -s tests -v
+```
+
+The suite uses temporary databases and source files, ephemeral localhost HTTP servers, and mocked Garmin responses. The HTTP fixtures capture the pre-refactor response contracts with generated timestamps normalized. Worker lifecycle checks exercise actual background processing and SIGTERM shutdown in a subprocess. No live Garmin fetch is required. Local socket tests need permission to bind localhost in restricted environments.
 
 ## Data and secrets
 

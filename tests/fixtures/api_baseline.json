@@ -1,0 +1,311 @@
+{
+  "/api/activities": {
+    "body": [
+      {
+        "distance_m": 200.0,
+        "duration_s": 120.0,
+        "has_track": 1,
+        "id": "sample",
+        "medals": [],
+        "sport": "cycling",
+        "start_time": "2026-01-01T10:00:00"
+      }
+    ],
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/destinations": {
+    "body": {
+      "destinations": [],
+      "excluded_activity_count": 0,
+      "processing": {
+        "epsilon_m": 75.0,
+        "error": null,
+        "id": 1,
+        "min_trips": 3,
+        "phase": "endpoints",
+        "progress_done": 0,
+        "progress_total": 0,
+        "published_revision": 0,
+        "revision": 2,
+        "status": "pending"
+      },
+      "unassigned_endpoint_count": 0
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/heatmap": {
+    "body": [
+      {
+        "id": "sample",
+        "segments": [
+          [
+            [
+              48.0,
+              11.0
+            ],
+            [
+              48.001,
+              11.001
+            ],
+            [
+              48.002,
+              11.002
+            ]
+          ]
+        ],
+        "sport": "cycling"
+      }
+    ],
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/route-collections": {
+    "body": [],
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/route-matching": {
+    "body": {
+      "error": null,
+      "full_percent": 90.0,
+      "id": 1,
+      "partial_percent": 20.0,
+      "progress_done": 0,
+      "progress_total": 0,
+      "published_revision": 0,
+      "revision": 3,
+      "status": "pending",
+      "tolerance_m": 50.0
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/routes": {
+    "body": {
+      "collection": null,
+      "routes": [
+        {
+          "ascent_m": null,
+          "collections": [],
+          "distance_m": 200.0,
+          "elevation_coverage": 0.0,
+          "id": "plan",
+          "name": "Planned trip",
+          "original_filename": "plan.gpx",
+          "point_count": 3,
+          "revision": 1,
+          "sport": "generic"
+        }
+      ]
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/routes/missing": {
+    "body": {
+      "error": "Route not found."
+    },
+    "cache": "no-store",
+    "status": 404
+  },
+  "/api/routes/plan": {
+    "body": {
+      "ascent_m": null,
+      "collections": [],
+      "distance_m": 200.0,
+      "elevation_coverage": 0.0,
+      "id": "plan",
+      "name": "Planned trip",
+      "notes": "",
+      "original_filename": "plan.gpx",
+      "point_count": 3,
+      "revision": 1,
+      "sport": "generic"
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/routes/plan/geometry": {
+    "body": {
+      "id": "plan",
+      "parts": [
+        [
+          [
+            48.0,
+            11.0
+          ],
+          [
+            48.001,
+            11.001
+          ],
+          [
+            48.002,
+            11.002
+          ]
+        ]
+      ],
+      "sampled": false,
+      "waypoints": []
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/routes/plan/track-matches": {
+    "body": {
+      "counts": {
+        "full": 0,
+        "partial": 0,
+        "total": 0
+      },
+      "matches": [],
+      "page": 0,
+      "processing": {
+        "error": null,
+        "full_percent": 90.0,
+        "id": 1,
+        "partial_percent": 20.0,
+        "progress_done": 0,
+        "progress_total": 0,
+        "published_revision": 0,
+        "revision": 3,
+        "status": "pending",
+        "tolerance_m": 50.0
+      }
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/segments": {
+    "body": [],
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/track/missing/segments": {
+    "body": {
+      "error": "Activity not found."
+    },
+    "cache": "no-store",
+    "status": 404
+  },
+  "/api/track/sample": {
+    "body": [
+      [
+        [
+          48.0,
+          11.0
+        ],
+        [
+          48.001,
+          11.001
+        ],
+        [
+          48.002,
+          11.002
+        ]
+      ]
+    ],
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/track/sample/route-matches": {
+    "body": {
+      "counts": {
+        "full": 0,
+        "partial": 0,
+        "total": 0
+      },
+      "matches": [],
+      "page": 0,
+      "processing": {
+        "error": null,
+        "full_percent": 90.0,
+        "id": 1,
+        "partial_percent": 20.0,
+        "progress_done": 0,
+        "progress_total": 0,
+        "published_revision": 0,
+        "revision": 3,
+        "status": "pending",
+        "tolerance_m": 50.0
+      }
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/track/sample/segments": {
+    "body": {
+      "failed_count": 0,
+      "pending_count": 0,
+      "segments": []
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/track/sample/speed": {
+    "body": {
+      "known_edge_count": 2,
+      "scale_max_kmh": 8.027483901925649,
+      "segments": [
+        {
+          "points": [
+            [
+              48.0,
+              11.0
+            ],
+            [
+              48.001,
+              11.001
+            ],
+            [
+              48.002,
+              11.002
+            ]
+          ],
+          "speeds_kmh": [
+            8.027486308082574,
+            8.027438184944064
+          ]
+        }
+      ],
+      "source": "gps_timestamps"
+    },
+    "cache": "no-store",
+    "status": 200
+  },
+  "/api/track/sample/temperature": {
+    "body": {
+      "availability": "loaded",
+      "known_edge_count": 2,
+      "message": null,
+      "scale_max_c": 13.0,
+      "scale_min_c": 11.0,
+      "segments": [
+        {
+          "points": [
+            [
+              48.0,
+              11.0
+            ],
+            [
+              48.001,
+              11.001
+            ],
+            [
+              48.002,
+              11.002
+            ]
+          ],
+          "temperatures_c": [
+            11.0,
+            13.0
+          ]
+        }
+      ],
+      "source": "recorded_temperature"
+    },
+    "cache": "no-store",
+    "status": 200
+  }
+}

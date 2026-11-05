@@ -2,7 +2,7 @@
 
 ## Project overview
 
-This is a local Garmin activity library. `app.py` imports and fetches FIT/GPX activities, stores metadata and GPS points in SQLite, exports analysis files, and serves the browser application.
+This is a local Garmin activity library. `app.py` is the CLI entry point; `garmin_library/` implements FIT/GPX import/fetch, SQLite persistence, exports, matching workers, and the HTTP server. Browser assets live in `web/`.
 
 ## Environment and commands
 
@@ -22,7 +22,9 @@ This is a local Garmin activity library. `app.py` imports and fetches FIT/GPX ac
 
 ## Implementation conventions
 
-- Keep activity parsing and CLI behavior in `app.py`; keep browser assets in `web/`.
+- Keep `app.py` as a small CLI entry point. Put backend behavior in the owning `garmin_library` feature module, HTTP endpoints in `garmin_library/http/`, and browser assets in `web/`.
+- Shared config, context, database, errors, and geometry modules must not import feature modules. Features must not import HTTP, server, CLI, or `app.py`. Pass `AppContext` explicitly to code that opens connections or uses configured paths; never restore mutable path globals. Each request/worker owns its SQLite connections.
+- Load `.env` only at CLI initialization. Importing backend modules must not read credentials, create databases, start workers, or make network requests. For authorized tests, use explicit temporary settings and mocked Garmin responses.
 - Support both FIT and GPX in import, fetch, and export paths when changing activity handling.
 - Preserve the existing SQLite schema unless a migration is required; if changing it, make database setup safely upgrade existing local databases.
 - Keep Garmin API requests paced and retain bounded retry/backoff for HTTP 429 and transient 5xx responses.
