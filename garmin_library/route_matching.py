@@ -165,85 +165,136 @@ def classify_route_match(match, route_length, state):
     if match is None or match["shared_m"] + 1e-7 < min(250, route_length * .5):
         return None
     coverage = match["route_coverage"] * 100
-    if coverage + 1e-9 >= state["full_percent"]:
+    shared_km = match["shared_m"] / 1000
+    full_km, partial_km = state.get("full_km"), state.get("partial_km")
+    if coverage + 1e-9 >= state["full_percent"] or (full_km is not None and shared_km + 1e-9 >= full_km):
         return "full"
-    if coverage + 1e-9 >= state["partial_percent"]:
+    if coverage + 1e-9 >= state["partial_percent"] or (partial_km is not None and shared_km + 1e-9 >= partial_km):
         return "partial"
     return None
 
 
+def queue_all_route_matches(db):
+    """Settings/retry invalidations deliberately rebuild every planned route."""
+    db.execute("""INSERT INTO route_matching_jobs(route_id) SELECT id FROM planned_routes WHERE 1
+        ON CONFLICT(route_id) DO UPDATE SET revision=revision+1,status='pending',error=NULL""")
+
+
+def update_matching_status(db):
+    counts = {row[0]: row[1] for row in db.execute(
+        "SELECT status,COUNT(*) FROM route_matching_jobs GROUP BY status")}
+    if counts.get("pending", 0) or counts.get("processing", 0):
+        db.execute("UPDATE route_matching_state SET status='processing',error=NULL WHERE id=1")
+    elif counts.get("failed", 0):
+        db.execute("""UPDATE route_matching_state SET status='failed',
+            error='Some routes could not be matched. Use Retry matching.' WHERE id=1""")
+    else:
+        db.execute("""UPDATE route_matching_state SET status='completed',error=NULL,
+            published_revision=revision,progress_done=progress_total WHERE id=1""")
+
+
+def matching_job_is_current(db, rid, revision):
+    row = db.execute("SELECT revision,status FROM route_matching_jobs WHERE route_id=?", (rid,)).fetchone()
+    return row is not None and row[0] == revision and row[1] == "processing"
+
+
+def process_route_matching_job(context, stop):
+    """Process and publish one route; unrelated uploads cannot invalidate it."""
+    rid, revision = None, None
+    try:
+        with closing(context.connect()) as progress, closing(context.connect()) as db:
+            if not progress.execute("SELECT 1 FROM route_matching_jobs WHERE status='pending' LIMIT 1").fetchone():
+                state = progress.execute("SELECT status FROM route_matching_state WHERE id=1").fetchone()
+                if state[0] in {"pending", "processing"}:
+                    progress.execute("BEGIN IMMEDIATE")
+                    update_matching_status(progress)
+                    progress.commit()
+                return False
+            progress.execute("BEGIN IMMEDIATE")
+            job = progress.execute("""SELECT route_id,revision FROM route_matching_jobs
+                WHERE status='pending' ORDER BY route_id LIMIT 1""").fetchone()
+            if job is None:
+                update_matching_status(progress)
+                progress.commit()
+                return False
+            rid, revision = job["route_id"], job["revision"]
+            progress.execute("UPDATE route_matching_jobs SET status='processing',error=NULL WHERE route_id=?", (rid,))
+            update_matching_status(progress)
+            progress.commit()
+            db.execute("BEGIN")
+            if not matching_job_is_current(db, rid, revision):
+                raise RouteMatchingCancelled()
+            state = dict(db.execute("SELECT * FROM route_matching_state WHERE id=1").fetchone())
+            route = matching_route_samples(db, rid)
+            results = []
+            if route["length"] > 0:
+                latitudes = [p[0] for p in route["points"]]
+                longitudes = [p[1] for p in route["points"]]
+                pad_lat = state["tolerance_m"] / 111_195
+                pad_lon = pad_lat / max(.001, min(math.cos(math.radians(lat)) for lat in latitudes))
+                min_lat, max_lat = min(latitudes)-pad_lat, max(latitudes)+pad_lat
+                min_lon, max_lon = min(longitudes)-pad_lon, max(longitudes)+pad_lon
+                # Prefer precomputed activity bounds; backfill missing entries in this read snapshot.
+                activities = db.execute("""SELECT a.id AS activity_id,b.min_lat,b.max_lat,b.min_lon,b.max_lon
+                    FROM activities a JOIN activity_bounds b ON b.activity_id=a.id
+                    UNION ALL SELECT activity_id,MIN(lat),MAX(lat),MIN(lon),MAX(lon)
+                    FROM track_points WHERE activity_id NOT IN (SELECT activity_id FROM activity_bounds)
+                    GROUP BY activity_id""")
+                for activity in activities:
+                    if stop.is_set() or not matching_job_is_current(progress, rid, revision):
+                        raise RouteMatchingCancelled()
+                    if (activity["max_lat"] < min_lat or activity["min_lat"] > max_lat or
+                        activity["max_lon"] < min_lon or activity["min_lon"] > max_lon):
+                        continue
+                    track = matching_track_samples(db, activity["activity_id"])
+                    if track["length"] <= 0:
+                        continue
+                    match = ordered_route_alignment(route, track, state["tolerance_m"], stop)
+                    classification = classify_route_match(match, route["length"], state)
+                    if classification:
+                        results.append((rid, activity["activity_id"], classification, match["route_coverage"],
+                                        match["track_coverage"], match["shared_m"], match["direction"],
+                                        json.dumps(match["ranges"]), state["revision"]))
+            db.rollback()
+            progress.execute("BEGIN IMMEDIATE")
+            if stop.is_set() or not matching_job_is_current(progress, rid, revision):
+                raise RouteMatchingCancelled()
+            # Publish only this route, retaining every other route's cached results.
+            progress.execute("DELETE FROM route_track_matches WHERE route_id=?", (rid,))
+            progress.executemany("INSERT INTO route_track_matches VALUES(?,?,?,?,?,?,?,?,?)", results)
+            progress.execute("DELETE FROM route_matching_jobs WHERE route_id=? AND revision=?", (rid, revision))
+            progress.execute("""UPDATE route_matching_state SET progress_done=progress_done+1,
+                progress_total=MAX(progress_total,progress_done+1) WHERE id=1""")
+            update_matching_status(progress)
+            progress.commit()
+            return True
+    except RouteMatchingCancelled:
+        if rid is not None:
+            with closing(context.connect()) as db:
+                db.execute("""UPDATE route_matching_jobs SET status='pending'
+                    WHERE route_id=? AND revision=? AND status='processing'""", (rid, revision))
+                update_matching_status(db)
+                db.commit()
+        return True
+    except Exception:
+        LOG.exception("Route matching failed for route %s", rid)
+        if rid is not None:
+            with closing(context.connect()) as db:
+                db.execute("""UPDATE route_matching_jobs SET status='failed',error='Route matching failed.'
+                    WHERE route_id=? AND revision=?""", (rid, revision))
+                update_matching_status(db)
+                db.commit()
+        return False
+
+
 def route_matching_worker(context, stop):
-    """Revision-checked snapshots keep old results readable during recalculation."""
+    """Resume durable jobs and isolate publication/failures to individual routes."""
     with closing(context.connect()) as db:
-        db.execute("UPDATE route_matching_state SET status='pending' WHERE status='processing'")
+        db.execute("UPDATE route_matching_jobs SET status='pending' WHERE status='processing'")
+        update_matching_status(db)
         db.commit()
     while not stop.is_set():
-        revision = None
-        try:
-            with closing(context.connect()) as progress, closing(context.connect()) as db:
-                state = dict(progress.execute("SELECT * FROM route_matching_state WHERE id=1").fetchone())
-                if state["status"] != "pending":
-                    stop.wait(2)
-                    continue
-                revision = state["revision"]
-                progress.execute("UPDATE route_matching_state SET status='processing',error=NULL,progress_done=0 WHERE id=1 AND revision=?", (revision,))
-                progress.commit()
-                db.execute("BEGIN")
-                # Snapshot all source versions together, including imports committed just before this read.
-                if db.execute("SELECT revision FROM route_matching_state WHERE id=1").fetchone()[0] != revision:
-                    continue
-                routes = [r[0] for r in db.execute("SELECT id FROM planned_routes ORDER BY id")]
-                activities = db.execute("""SELECT activity_id,MIN(lat) AS min_lat,MAX(lat) AS max_lat,
-                    MIN(lon) AS min_lon,MAX(lon) AS max_lon FROM track_points GROUP BY activity_id""").fetchall() if routes else []
-                progress.execute("UPDATE route_matching_state SET progress_total=? WHERE id=1 AND revision=?", (len(routes), revision))
-                progress.commit()
-                results = []
-                for done, rid in enumerate(routes, 1):
-                    if stop.is_set() or progress.execute("SELECT revision FROM route_matching_state WHERE id=1").fetchone()[0] != revision:
-                        raise RouteMatchingCancelled()
-                    route = matching_route_samples(db, rid)
-                    if route["length"] <= 0:
-                        continue
-                    latitudes = [p[0] for p in route["points"]]
-                    longitudes = [p[1] for p in route["points"]]
-                    pad_lat = state["tolerance_m"] / 111_195
-                    pad_lon = pad_lat / max(.001, min(math.cos(math.radians(lat)) for lat in latitudes))
-                    min_lat, max_lat = min(latitudes)-pad_lat, max(latitudes)+pad_lat
-                    min_lon, max_lon = min(longitudes)-pad_lon, max(longitudes)+pad_lon
-                    for activity in activities:
-                        if stop.is_set() or progress.execute("SELECT revision FROM route_matching_state WHERE id=1").fetchone()[0] != revision:
-                            raise RouteMatchingCancelled()
-                        if (activity["max_lat"] < min_lat or activity["min_lat"] > max_lat or
-                            activity["max_lon"] < min_lon or activity["min_lon"] > max_lon):
-                            continue
-                        track = matching_track_samples(db, activity["activity_id"])
-                        if track["length"] <= 0:
-                            continue
-                        match = ordered_route_alignment(route, track, state["tolerance_m"], stop)
-                        classification = classify_route_match(match, route["length"], state)
-                        if classification:
-                            results.append((rid, activity["activity_id"], classification, match["route_coverage"],
-                                            match["track_coverage"], match["shared_m"], match["direction"],
-                                            json.dumps(match["ranges"]), revision))
-                    progress.execute("UPDATE route_matching_state SET progress_done=? WHERE id=1 AND revision=?", (done, revision))
-                    progress.commit()
-                db.rollback()
-                progress.execute("BEGIN IMMEDIATE")
-                if stop.is_set() or progress.execute("SELECT revision FROM route_matching_state WHERE id=1").fetchone()[0] != revision:
-                    raise RouteMatchingCancelled()
-                progress.execute("DELETE FROM route_track_matches")
-                progress.executemany("INSERT INTO route_track_matches VALUES(?,?,?,?,?,?,?,?,?)", results)
-                progress.execute("UPDATE route_matching_state SET status='completed',error=NULL,published_revision=?,progress_done=progress_total WHERE id=1", (revision,))
-                progress.commit()
-        except RouteMatchingCancelled:
-            # New input already queued the next generation. Interrupted processing resumes on startup.
-            continue
-        except Exception:
-            LOG.exception("Route matching failed")
-            if revision is not None:
-                with closing(context.connect()) as db:
-                    db.execute("UPDATE route_matching_state SET status='failed',error='Route matching failed. Use Retry matching.' WHERE id=1 AND revision=?", (revision,))
-                    db.commit()
+        if not process_route_matching_job(context, stop):
             stop.wait(2)
 
 
@@ -271,11 +322,10 @@ def route_match_results(db, kind, identifier, query):
 
 
 def route_match_geometry(db, rid, aid):
-    state = db.execute("SELECT * FROM route_matching_state WHERE id=1").fetchone()
     match = db.execute("SELECT * FROM route_track_matches WHERE route_id=? AND activity_id=?", (rid, aid)).fetchone()
     if match is None:
         raise AppError(404, "Match not found.")
-    if match["generation"] != state["revision"]:
+    if db.execute("SELECT 1 FROM route_matching_jobs WHERE route_id=?", (rid,)).fetchone():
         raise AppError(409, "Match geometry is updating. Please wait for matching to finish.")
     route, track = matching_route_samples(db, rid), matching_track_samples(db, aid)
     ranges = json.loads(match["ranges"])

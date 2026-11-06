@@ -97,3 +97,22 @@ class HTTPTests(TemporaryLibrary, unittest.TestCase):
         self.assertEqual(self.request('/api/route-matching','PUT',body)[0],409)
         self.assertEqual(self.request('/api/route-matching','PUT',b'{broken',{'Content-Type':'application/json'})[0],400)
         self.assertEqual(self.request('/api/route-matching','PUT',b'no',{'Content-Type':'text/plain'})[0],415)
+
+    def test_distance_settings_validation_disable_and_preserve_omitted_values(self):
+        def save(**changes):
+            state=self.request('/api/route-matching')[1]
+            body={key:state[key] for key in ('revision','tolerance_m','partial_percent','full_percent')}
+            body.update(changes)
+            return self.request('/api/route-matching','PUT',body)
+        for changes in ({'partial_km':0},{'partial_km':-1},{'partial_km':True},
+                        {'partial_km':'5'},{'partial_km':float('inf')},
+                        {'partial_km':20,'full_km':5}):
+            with self.subTest(changes=changes):self.assertEqual(save(**changes)[0],400)
+        status,state,_=save(partial_km=5,full_km=50)
+        self.assertEqual(status,200)
+        status,state,_=save(tolerance_m=60)
+        self.assertEqual((state['partial_km'],state['full_km']),(5,50))
+        status,state,_=save(partial_km=None,full_km=None)
+        self.assertEqual(status,200)
+        self.assertIsNone(state['partial_km']);self.assertIsNone(state['full_km'])
+        self.assertEqual(state['status'],'pending')

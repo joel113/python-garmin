@@ -87,6 +87,26 @@ class RouteMatchingTests(unittest.TestCase):
         self.assertEqual(matching_samples([[[48,11],[48,11]]])["length"], 0)
 
 
+    def test_distance_or_percentage_thresholds_and_full_precedence(self):
+        settings = {**self.settings, "partial_km":5, "full_km":20}
+        def classify(shared, length):
+            return classify_route_match({"route_coverage":shared/length,"shared_m":shared},length,settings)
+        self.assertEqual(classify(5000,500000),"partial")
+        self.assertIsNone(classify(4999,500000))
+        self.assertEqual(classify(20000,500000),"full")
+        self.assertEqual(classify(19999,500000),"partial")
+        self.assertEqual(classify(950,1000),"full")
+        self.assertEqual(classify(300,1000),"partial")
+        settings.update(partial_km=None,full_km=None)
+        self.assertIsNone(classify(5000,500000))
+        self.assertEqual(classify(950,1000),"full")
+        settings.update(full_km=5)
+        self.assertEqual(classify(5000,500000),"full")
+        # Explicit distance settings do not bypass the existing crossing safeguard.
+        settings.update(partial_km=.1,full_km=.2)
+        self.assertIsNone(classify(200,500000))
+
+
 class RouteMatchingPersistenceTests(unittest.TestCase):
     def setUp(self):
         from garmin_library.context import AppContext
@@ -106,6 +126,7 @@ class RouteMatchingPersistenceTests(unittest.TestCase):
     def cache(self):
         revision = self.db.execute("SELECT revision FROM route_matching_state").fetchone()[0]
         self.db.execute("INSERT INTO route_track_matches VALUES('route','track','full',1,.5,1000,'forward','{}',?)", (revision,))
+        self.db.execute("DELETE FROM route_matching_jobs")
         self.db.execute("UPDATE route_matching_state SET published_revision=revision,status='completed'")
         self.db.commit()
         return revision

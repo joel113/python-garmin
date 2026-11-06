@@ -132,3 +132,21 @@ with patch.object(config, "load_dotenv", side_effect=AssertionError("dotenv load
 '''
         result=subprocess.run([sys.executable,'-c',code],cwd=Path(__file__).resolve().parents[1],capture_output=True,text=True,timeout=20)
         self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_distance_threshold_migration_preserves_settings_and_queues_once(self):
+        with closing(sqlite3.connect(self.context.settings.database_path)) as db:
+            db.executescript("""CREATE TABLE route_matching_state (
+                id INTEGER PRIMARY KEY,tolerance_m REAL,full_percent REAL,partial_percent REAL,
+                revision INTEGER,published_revision INTEGER,status TEXT,error TEXT,
+                progress_done INTEGER,progress_total INTEGER);
+                INSERT INTO route_matching_state VALUES(1,70,88,12,7,7,'completed',NULL,1,1);""")
+        with closing(self.context.connect()) as db:
+            state=dict(db.execute('SELECT * FROM route_matching_state').fetchone())
+            self.assertEqual((state['full_km'],state['partial_km']),(20,5))
+            self.assertEqual((state['full_percent'],state['partial_percent'],state['tolerance_m']),(88,12,70))
+            self.assertEqual((state['revision'],state['published_revision'],state['status']),(8,7,'pending'))
+            db.execute('UPDATE route_matching_state SET partial_km=NULL');db.commit()
+        with closing(self.context.connect()) as db:
+            state=dict(db.execute('SELECT * FROM route_matching_state').fetchone())
+            self.assertEqual(state['revision'],8)
+            self.assertIsNone(state['partial_km'])

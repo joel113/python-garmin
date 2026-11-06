@@ -53,6 +53,7 @@ def connect(db_path: Path):
       CREATE TABLE IF NOT EXISTS route_matching_state (
         id INTEGER PRIMARY KEY CHECK(id=1), tolerance_m REAL NOT NULL DEFAULT 50,
         full_percent REAL NOT NULL DEFAULT 90, partial_percent REAL NOT NULL DEFAULT 20,
+        full_km REAL DEFAULT 20, partial_km REAL DEFAULT 5,
         revision INTEGER NOT NULL DEFAULT 1, published_revision INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'pending', error TEXT,
         progress_done INTEGER NOT NULL DEFAULT 0, progress_total INTEGER NOT NULL DEFAULT 0
@@ -66,18 +67,6 @@ def connect(db_path: Path):
         generation INTEGER NOT NULL, PRIMARY KEY(route_id,activity_id)
       );
       CREATE INDEX IF NOT EXISTS route_match_activity_idx ON route_track_matches(activity_id);
-      CREATE TRIGGER IF NOT EXISTS route_matching_activity_insert AFTER INSERT ON activities BEGIN
-        UPDATE route_matching_state SET revision=revision+1,status='pending',error=NULL WHERE id=1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS route_matching_activity_delete AFTER DELETE ON activities BEGIN
-        UPDATE route_matching_state SET revision=revision+1,status='pending',error=NULL WHERE id=1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS route_matching_route_insert AFTER INSERT ON planned_routes BEGIN
-        UPDATE route_matching_state SET revision=revision+1,status='pending',error=NULL WHERE id=1;
-      END;
-      CREATE TRIGGER IF NOT EXISTS route_matching_route_delete AFTER DELETE ON planned_routes BEGIN
-        UPDATE route_matching_state SET revision=revision+1,status='pending',error=NULL WHERE id=1;
-      END;
       CREATE TABLE IF NOT EXISTS segments (
         id INTEGER PRIMARY KEY, name TEXT NOT NULL, sport TEXT NOT NULL,
         radius_m REAL NOT NULL DEFAULT 30, revision INTEGER NOT NULL DEFAULT 1,
@@ -151,4 +140,62 @@ def connect(db_path: Path):
         if "temperature_c" not in {row[1] for row in db.execute("PRAGMA table_info(track_points)")}:
             db.execute("ALTER TABLE track_points ADD COLUMN temperature_c REAL")
         db.commit()
+    distance_columns = {"full_km": "REAL DEFAULT 20", "partial_km": "REAL DEFAULT 5"}
+    if set(distance_columns) - {row[1] for row in db.execute("PRAGMA table_info(route_matching_state)")}:
+        db.execute("BEGIN IMMEDIATE")
+        existing = {row[1] for row in db.execute("PRAGMA table_info(route_matching_state)")}
+        missing = set(distance_columns) - existing
+        for column in sorted(missing):
+            db.execute(f"ALTER TABLE route_matching_state ADD COLUMN {column} {distance_columns[column]}")
+        if missing:
+            # Older caches excluded low-percentage overlaps; rebuild to discover them.
+            db.execute("""UPDATE route_matching_state SET revision=revision+1,status='pending',error=NULL,
+                progress_done=0,progress_total=0 WHERE id=1""")
+        db.commit()
+    setup_route_matching_queue(db)
     return db
+
+def setup_route_matching_queue(db):
+    """Install durable per-route jobs once, preserving completed legacy caches."""
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS app_migrations(name TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS route_matching_jobs(
+            route_id TEXT PRIMARY KEY REFERENCES planned_routes(id) ON DELETE CASCADE,
+            revision INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'pending', error TEXT
+        );
+    """)
+    migration = "route_matching_jobs_v1"
+    if db.execute("SELECT 1 FROM app_migrations WHERE name=?", (migration,)).fetchone():
+        return
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if db.execute("SELECT 1 FROM app_migrations WHERE name=?", (migration,)).fetchone():
+            db.commit()
+            return
+        queue_all = """INSERT INTO route_matching_jobs(route_id) SELECT id FROM planned_routes WHERE 1
+            ON CONFLICT(route_id) DO UPDATE SET revision=revision+1,status='pending',error=NULL;"""
+        changed = """UPDATE route_matching_state SET revision=revision+1,status='pending',error=NULL,
+            progress_done=0,progress_total=(SELECT COUNT(*) FROM route_matching_jobs) WHERE id=1;"""
+        triggers = {
+            "route_matching_activity_insert": ("INSERT", "activities", queue_all),
+            "route_matching_activity_delete": ("DELETE", "activities", queue_all),
+            "route_matching_route_insert": ("INSERT", "planned_routes",
+                "INSERT INTO route_matching_jobs(route_id) VALUES(NEW.id);"),
+            "route_matching_route_delete": ("DELETE", "planned_routes",
+                "DELETE FROM route_matching_jobs WHERE route_id=OLD.id;"),
+        }
+        for name, (event, table, queue) in triggers.items():
+            db.execute(f"DROP TRIGGER IF EXISTS {name}")
+            db.execute(f"CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN {queue} {changed} END")
+        state = db.execute("SELECT status,revision,published_revision FROM route_matching_state WHERE id=1").fetchone()
+        if state[0] != "completed" or state[1] != state[2]:
+            # An unfinished legacy global run has no per-route completion markers.
+            db.execute(queue_all)
+            db.execute("""UPDATE route_matching_state SET status='pending',error=NULL,progress_done=0,
+                progress_total=(SELECT COUNT(*) FROM route_matching_jobs) WHERE id=1""")
+        db.execute("INSERT INTO app_migrations VALUES(?)", (migration,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise

@@ -17,7 +17,7 @@ window.routeMatchUI=(()=>{
   function updateSettings(state) {
     if(!settingsDirty&&!settingsBusy) {
       settingsState=state;
-      for(const key of ["tolerance_m","partial_percent","full_percent"])settingsForm.elements[key].value=state[key];
+      for(const key of ["tolerance_m","partial_percent","full_percent","partial_km","full_km"])settingsForm.elements[key].value=state[key]??"";
     }
     if(!settingsBusy)settingsStatus.textContent=stateText(state);
   }
@@ -98,6 +98,9 @@ window.routeMatchUI=(()=>{
   settingsForm.onsubmit=async event=>{
     event.preventDefault();if(settingsBusy||!settingsState)return;
     const body={revision:settingsState.revision};for(const key of ["tolerance_m","partial_percent","full_percent"])body[key]=Number(settingsForm.elements[key].value);
+    for(const key of ["partial_km","full_km"]) {
+      const value=settingsForm.elements[key].value.trim();body[key]=value===""?null:Number(value);
+    }
     settingsBusy=true;settingsForm.querySelectorAll("button").forEach(b=>b.disabled=true);
     try {
       const state=await api("route-matching","PUT",body);settingsDirty=false;settingsBusy=false;updateSettings(state);
