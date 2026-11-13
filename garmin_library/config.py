@@ -36,11 +36,16 @@ class Settings:
     database_path: Path = PROJECT_ROOT / "activities.sqlite3"
     activities_path: Path = PROJECT_ROOT / "storage" / "activities"
     allowed_hosts: str = ""
+    network_engine_url: str = "http://127.0.0.1:8002"
     api_key: str | None = field(default=None, repr=False)
 
     @property
     def web_path(self) -> Path:
         return self.root / "web"
+
+    @property
+    def network_path(self) -> Path:
+        return self.database_path.parent / "network"
 
     @property
     def routes_path(self) -> Path:
@@ -59,4 +64,5 @@ class Settings:
                    database_path=configured_path("GARMIN_DB_PATH", root / "activities.sqlite3"),
                    activities_path=configured_path("GARMIN_ACTIVITIES_PATH", root / "storage/activities"),
                    allowed_hosts=environ.get("GARMIN_ALLOWED_HOSTS", ""),
+                   network_engine_url=environ.get("GARMIN_NETWORK_ENGINE_URL", "http://127.0.0.1:8002").rstrip("/"),
                    api_key=environ.get("GARMIN_API_KEY"))

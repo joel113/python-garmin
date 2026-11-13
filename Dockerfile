@@ -1,5 +1,10 @@
 FROM python:3.12-slim-trixie
 
+# Pyosmium needs Expat when importing the cropped street/path network.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:0.13.6 /uv /usr/local/bin/uv
 
 ENV PYTHONUNBUFFERED=1 \

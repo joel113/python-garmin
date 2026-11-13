@@ -1,6 +1,9 @@
 # Only the application and its locked dependency manifests enter the build.
 **
 !Dockerfile
+!Dockerfile.network
+!network_engine/
+!network_engine/**
 !pyproject.toml
 !uv.lock
 !README.md

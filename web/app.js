@@ -10,6 +10,7 @@ let activities=[], selected=null, heatVersion=0, trackVersion=0;
 const maps={}, layers={};
 let trackSegmentData=[], trackSegmentPoll=null, trackSegmentRequest=0;
 let trackCoordinates=[],trackSpeedData=null,trackTemperatureData=null,trackSpeedRequest=0;
+let trackExplorationData=null,trackExplorationRequest=0;
 const trackColorMode=()=>$("#track-color-temperature").checked?"temperature":$("#track-color-speed").checked?"speed":null;
 const segmentTime=value=>{
   if(value==null) return "Untimed";
@@ -181,6 +182,8 @@ function renderList() {
 }
 async function showTrack(id) {
   const version=++trackVersion; selected=id; renderList();
+  trackExplorationData=null;trackExplorationRequest++;
+  clearTrackExploration();
   trackSpeedRequest++;trackCoordinates=[];trackSpeedData=null;trackTemperatureData=null;
   $("#track-speed-legend").hidden=true;
   clearTimeout(trackSegmentPoll);
@@ -190,6 +193,8 @@ async function showTrack(id) {
   $("#track-details").hidden=false;
   const activity=activities.find(a=>a.id===id);
   $("#track-overview").textContent=activity ? date(activity.start_time)+" · "+sportName(activity.sport)+" · "+km(activity.distance_m)+" · "+hours(activity.duration_s)+" · Activity "+id : "Activity "+id;
+  loadTrackEquipment(id,version);
+  loadTrackExploration(id,version);
   $("#track-segment-results").replaceChildren();
   $("#track-segment-status").textContent="Loading segment results…";
   $("#track-status").textContent="Loading route…";
@@ -209,6 +214,90 @@ async function showTrack(id) {
     const a=activities.find(a=>a.id===id);
     $("#track-status").textContent=a ? date(a.start_time)+" · "+sportName(a.sport)+" · "+km(a.distance_m)+" · "+hours(a.duration_s) : id;
   } catch(error) { $("#track-status").textContent="Could not load this route."; report(error); }
+}
+function clearTrackExploration() {
+  if(layers.trackExploration){layers.trackExploration.remove();layers.trackExploration=null;}
+}
+function drawTrackExploration() {
+  clearTrackExploration();
+  if(!maps.map||!$("#track-show-new-paths").checked||!trackExplorationData?.geometry)return;
+  if(!maps.map.getPane("track-exploration")){
+    const pane=maps.map.createPane("track-exploration");pane.style.zIndex=430;pane.style.pointerEvents="none";
+  }
+  layers.trackExploration=L.featureGroup().addTo(maps.map);
+  L.geoJSON(trackExplorationData.geometry,{pane:"track-exploration",interactive:false,style:{color:"#fff",weight:8,opacity:.95}}).addTo(layers.trackExploration);
+  L.geoJSON(trackExplorationData.geometry,{pane:"track-exploration",interactive:false,style:{color:"#d000c8",weight:4,opacity:1}}).addTo(layers.trackExploration);
+}
+async function loadTrackExploration(id,version) {
+  const request=++trackExplorationRequest,geometry=$("#track-show-new-paths").checked;
+  $("#track-exploration-status").textContent="Loading newly explored paths…";
+  $("#track-exploration-summary").textContent="";
+  try {
+    const data=await getJSON("/api/track/"+encodeURIComponent(id)+"/exploration"+(geometry?"?geometry=1":""));
+    if(version!==trackVersion||request!==trackExplorationRequest)return;
+    trackExplorationData=data;
+    if(data.new_percent!=null){
+      $("#track-exploration-summary").textContent="New paths: "+km(data.new_m)+" · "+data.new_percent.toLocaleString(undefined,{maximumFractionDigits:1})+"% of unique matched distance · "+km(data.matched_unique_m)+" unique matched";
+    }
+    const notes=[data.message];
+    if(data.status==="provisional")notes.push("Provisional estimate.");
+    if(data.missing_history_matches)notes.push(data.missing_history_matches+" earlier activities lack current matches.");
+    if(data.partial_history_activities)notes.push(data.partial_history_activities+" earlier activities have partially unknown map coverage.");
+    if(data.undated_history_activities)notes.push(data.undated_history_activities+" other activities have no usable date and were excluded.");
+    if(data.outside_coverage)notes.push("Parts of this track extend outside installed map coverage.");
+    if(data.unmatched_points)notes.push(data.unmatched_points+" GPS samples are unmatched; unknown paths are not counted as new.");
+    if(data.new_percent!=null)notes.push("Repeated laps and return journeys count once. Magenta highlights matched paths first recorded in this library.");
+    $("#track-exploration-status").textContent=notes.filter(Boolean).join(" ");
+    drawTrackExploration();
+  } catch(error) {
+    if(version!==trackVersion||request!==trackExplorationRequest)return;
+    clearTrackExploration();trackExplorationData=null;
+    $("#track-exploration-status").textContent="Could not load exploration data. Use Refresh exploration to retry.";
+  }
+}
+$("#track-show-new-paths").onchange=()=>{
+  if(!$("#track-show-new-paths").checked){drawTrackExploration();return;}
+  if(trackExplorationData?.geometry)drawTrackExploration();
+  else if(selected)loadTrackExploration(selected,trackVersion);
+};
+$("#track-exploration-refresh").onclick=()=>{
+  clearTrackExploration();trackExplorationData=null;
+  if(selected)loadTrackExploration(selected,trackVersion);
+};
+async function loadTrackEquipment(id,version) {
+  const status=$("#track-equipment-status"),types=$("#track-equipment-types"),list=$("#track-equipment-workouts");
+  status.textContent="Loading workout equipment…";types.replaceChildren();list.replaceChildren();
+  try {
+    const data=await getJSON("/api/track/"+encodeURIComponent(id)+"/equipment");
+    if(version!==trackVersion)return;
+    const messages={not_fetched:"Workout equipment has not been fetched for this activity.",
+      no_workouts:"Garmin returned no structured workouts for this activity.",
+      no_equipment:"No equipment is specified in this activity’s workout steps.",
+      loaded:"Equipment specified by the workout instructions; actual use is not confirmed.",
+      failed:"Workout equipment could not be fetched.",
+      refresh_failed:"Refresh failed. Showing the last successfully fetched workout instructions."};
+    status.textContent=(messages[data.status]||"Workout equipment unavailable.")+
+      (data.error?" "+data.error:"")+(data.fetched_at?" Last fetched: "+data.fetched_at+" UTC.":"");
+    const labels={SWIM_FINS:"Swim fins",SWIM_KICKBOARD:"Kickboard",SWIM_PULL_BUOY:"Pull buoy"};
+    const label=value=>labels[value]||value;
+    for(const type of data.equipment_types){
+      const badge=document.createElement("span");badge.className="equipment-tag";badge.textContent=label(type);types.append(badge);
+    }
+    data.workouts.forEach((workout,index)=>{
+      const steps=(workout.steps||[]).filter(step=>step.equipmentType&&step.equipmentType!=="NONE");
+      if(!steps.length)return;
+      const item=document.createElement("li"),title=document.createElement("strong"),assignments=document.createElement("ul");
+      title.textContent=workout.workoutName||"Workout "+(index+1);item.append(title);
+      steps.forEach(step=>{
+        const entry=document.createElement("li");
+        const number=Number.isInteger(step.stepIndex)?step.stepIndex+1:(workout.steps.indexOf(step)+1);
+        entry.textContent=(step.name||"Step "+number)+" · "+label(step.equipmentType);assignments.append(entry);
+      });
+      item.append(assignments);list.append(item);
+    });
+  } catch(error) {
+    if(version===trackVersion)status.textContent="Could not load workout equipment from the local database.";
+  }
 }
 function renderTrackRoute() {
   if(!maps.map || !trackCoordinates.length) return;
@@ -411,6 +500,12 @@ async function showHeat() {
   const version=++heatVersion; $("#heat-status").textContent="Loading routes…";
   try {
     const map=getMap("heatmap");
+    if($("#heat-mode").value==="coverage") {
+      if(layers.heat){map.removeLayer(layers.heat);layers.heat=null;}
+      window.coverageUI.show(map);return;
+    }
+    if(window.coverageUI)window.coverageUI.hide();
+    updateHeatStyle();
     const routes=await getJSON("/api/heatmap?sport="+encodeURIComponent($("#sport-filter").value));
     if (version!==heatVersion) return;
     if (layers.heat) map.removeLayer(layers.heat);
@@ -439,6 +534,7 @@ function switchView(view) {
   if(window.routesUI && view!=="routes") window.routesUI.hide();
   if(window.destinationUI && view!=="destinations") window.destinationUI.hide();
   clearTimeout(trackSegmentPoll);
+  if(view!=="heat"&&window.coverageUI)window.coverageUI.hide();
   if(window.routeMatchUI) window.routeMatchUI.hideExcept(view);
   document.querySelectorAll(".view").forEach(section=>section.hidden=section.id!==view);
   document.querySelectorAll("[data-view]").forEach(button=>{if(button.dataset.view===view) button.setAttribute("aria-current","page"); else button.removeAttribute("aria-current");});
@@ -462,7 +558,7 @@ function switchView(view) {
 }
 document.querySelectorAll("[data-view]").forEach(button=>button.onclick=()=>switchView(button.dataset.view));
 $("#sport-filter").onchange=showHeat; $("#search").oninput=renderList;
-$("#heat-mode").onchange=updateHeatStyle;
+$("#heat-mode").onchange=showHeat;
 $("#heat-color").oninput=updateHeatStyle;
 $("#track-show-segments").onchange=drawTrackSegments;
 $("#track-color-speed").onchange=()=>{if($("#track-color-speed").checked) $("#track-color-temperature").checked=false;loadTrackSpeed();};

@@ -8,9 +8,12 @@ import logging
 
 from garmin_library.activities import ensure_track_temperature, track_speed_data, track_temperature_data
 from garmin_library.errors import AppError
+from garmin_library.errors import AppError
 from garmin_library.geometry import display_segments
 from garmin_library.route_matching import route_match_results
 from garmin_library.segments import activity_medals, track_segment_results
+from garmin_library.workouts import activity_equipment
+from garmin_library.exploration import track_exploration
 
 LOG = logging.getLogger(__name__)
 
@@ -59,6 +62,11 @@ def handle(handler):
                     result["message"] = availability.get("message")
                     return handler.send_json(result)
                 db.execute("BEGIN")
+                if len(parts) == 4 and parts[3] == 'exploration':
+                    query = parse_qs(urlsplit(handler.path).query)
+                    return handler.send_json(track_exploration(db, aid, geometry=query.get('geometry') == ['1']))
+                if len(parts) == 4 and parts[3] == 'equipment':
+                    return handler.send_json(activity_equipment(db, aid))
                 if len(parts) == 4 and parts[3] == "route-matches":
                     return handler.send_json(route_match_results(db, "activity", aid, parse_qs(urlsplit(handler.path).query)))
                 if len(parts) == 4 and parts[3] == "segments":

@@ -1,4 +1,4 @@
-"""Local HTTP server and the lifecycle of its three matching workers."""
+"""Local HTTP server and the lifecycle of its background workers."""
 from __future__ import annotations
 
 from contextlib import closing
@@ -10,6 +10,7 @@ from garmin_library.activities import import_all
 from garmin_library.context import AppContext
 from garmin_library.destinations import destination_worker
 from garmin_library.http import Handler
+from garmin_library.network_worker import network_worker
 from garmin_library.route_matching import route_matching_worker
 from garmin_library.segments import segment_worker
 
@@ -27,6 +28,7 @@ def serve(context: AppContext, host: str, port: int):
         db.execute("PRAGMA journal_mode=WAL")
     stop = threading.Event()
     workers = [
+        (threading.Thread(target=network_worker, args=(context, stop), daemon=True, name="network-coverage"), 3),
         (threading.Thread(target=segment_worker, args=(context, stop), daemon=True, name="segment-matcher"), 25),
         (threading.Thread(target=destination_worker, args=(context, stop), daemon=True, name="destination-clustering"), 3),
         (threading.Thread(target=route_matching_worker, args=(context, stop), daemon=True, name="route-matching"), 3),

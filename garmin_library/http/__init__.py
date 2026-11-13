@@ -6,7 +6,7 @@ from urllib.parse import quote, urlsplit
 import json
 
 from garmin_library.errors import AppError
-from garmin_library.http import activities, destinations, route_matching, routes, segments
+from garmin_library.http import activities, destinations, network_coverage, route_matching, routes, segments
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -21,6 +21,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path.startswith("/api/network-coverage"):
+            return network_coverage.handle(self, "GET")
         if path.startswith("/api/route-matching"):
             return route_matching.handle(self, "GET")
         if path.startswith(("/api/routes", "/api/route-collections")):
@@ -46,6 +48,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def mutation_request(self, method):
         path = urlsplit(self.path).path
+        if path.startswith("/api/network-coverage"):
+            return network_coverage.handle(self, method)
         if path.startswith("/api/route-matching"):
             return route_matching.handle(self, method)
         if path.startswith(("/api/routes", "/api/route-collections")):

@@ -62,6 +62,35 @@ class HTTPTests(TemporaryLibrary, unittest.TestCase):
         self.assertEqual(status,200)
         self.assertIn(b'Temporary library',body)
 
+    def test_track_equipment_is_local_and_reports_missing_activity(self):
+        with patch('garmin_library.garmin.api_request', side_effect=AssertionError('HTTP reads must remain offline')):
+            status, result, _ = self.request('/api/track/sample/equipment')
+            self.assertEqual(status,200)
+            self.assertEqual(result['status'],'not_fetched')
+            self.assertEqual(result['equipment_types'],[])
+            self.assertEqual(self.request('/api/track/missing/equipment')[0],404)
+            with closing(self.context.connect()) as db:
+                db.execute("INSERT INTO activity_workouts VALUES('sample','[]',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,NULL)")
+                db.commit()
+            self.assertEqual(self.request('/api/track/sample/equipment')[1]['status'],'no_workouts')
+            payload=[{'workoutName':'<Workout>', 'steps':[{'stepIndex':2,'name':'Kick','equipmentType':'SWIM_KICKBOARD'}]}]
+            with closing(self.context.connect()) as db:
+                db.execute('UPDATE activity_workouts SET payload_json=? WHERE activity_id=?',(json.dumps(payload),'sample'))
+                db.commit()
+            result=self.request('/api/track/sample/equipment')[1]
+            self.assertEqual(result['equipment_types'],['SWIM_KICKBOARD'])
+            self.assertEqual(result['workouts'],payload)
+
+    def test_exploration_api_is_read_only_and_handles_unavailable_coverage(self):
+        with patch('garmin_library.network_maps.request_json',side_effect=AssertionError('No matching requests')):
+            code,result,_=self.request('/api/track/sample/exploration?geometry=1')
+            self.assertEqual(code,200)
+            self.assertEqual(result['status'],'unavailable')
+            self.assertIsNone(result['new_percent'])
+            self.assertEqual(result['geometry'],{'type':'FeatureCollection','features':[]})
+            self.assertNotIn('geometry',self.request('/api/track/sample/exploration')[1])
+            self.assertEqual(self.request('/api/track/missing/exploration')[0],404)
+
     def test_route_upload_collection_order_notes_and_download(self):
         status, collection, _ = self.request('/api/route-collections','POST',{'name':'Holiday'})
         self.assertEqual(status,201)
@@ -116,3 +145,34 @@ class HTTPTests(TemporaryLibrary, unittest.TestCase):
         self.assertEqual(status,200)
         self.assertIsNone(state['partial_km']);self.assertIsNone(state['full_km'])
         self.assertEqual(state['status'],'pending')
+
+    def test_network_coverage_setup_is_explicit_and_same_origin(self):
+        status,state,_=self.request('/api/network-coverage')
+        self.assertEqual(status,200);self.assertEqual(state['status'],'unconfigured')
+        region={'id':'fixture','name':'Synthetic region','url':'https://download.geofabrik.de/fixture.osm.pbf',
+                'geometry':{'type':'Polygon','coordinates':[[[11,48],[11.01,48],[11.01,48.01],[11,48.01],[11,48]]]}}
+        body={'regions':['fixture'],'revision':state['revision']}
+        with patch('garmin_library.network_coverage.catalog',return_value=[region]):
+            self.assertEqual(self.request('/api/network-coverage/setup','POST',body,{'Origin':'https://untrusted.invalid'})[0],403)
+            self.assertEqual(self.request('/api/network-coverage/setup','POST',body)[0],202)
+            self.assertEqual(self.request('/api/network-coverage/setup','POST',body)[0],409)
+        staged=self.request('/api/network-coverage')[1]
+        self.assertIsNotNone(staged['staging_generation']);self.assertIsNone(staged['active_generation'])
+        self.assertEqual(self.request('/api/network-coverage/cancel','POST',{'revision':staged['revision']})[0],202)
+        self.assertEqual(self.request('/api/network-coverage')[1]['status'],'unconfigured')
+        self.assertEqual(self.request('/api/network-coverage/tiles/40/0/0.pbf')[0],400)
+        self.assertEqual(self.request('/api/network-coverage?sport=driving')[0],400)
+
+    def test_track_based_preview_and_setup(self):
+        region={'id':'tiny','name':'Tiny','url':'https://download.geofabrik.de/tiny.osm.pbf','geometry':{'type':'Polygon','coordinates':[[[10,47],[12,47],[12,49],[10,49],[10,47]]]}}
+        with patch('garmin_library.network_coverage.catalog',return_value=[region]),patch('garmin_library.network_maps.region_size',return_value=1000):
+            code,preview,_=self.request('/api/network-coverage/preview','POST',{'buffer_km':2})
+            self.assertEqual(code,200);self.assertGreater(preview['area_km2'],0)
+            self.assertEqual(preview['regions'][0]['id'],'tiny')
+            state=self.request('/api/network-coverage')[1]
+            code,created,_=self.request('/api/network-coverage/setup','POST',{'mode':'tracks','preview_id':preview['id'],'revision':state['revision']})
+            self.assertEqual(code,202)
+        state=self.request('/api/network-coverage')[1]
+        self.assertEqual(state['generations'][0]['mode'],'tracks')
+        self.assertIsNotNone(state['generations'][0]['footprint'])
+        self.assertEqual(self.request('/api/network-coverage/preview','POST',{'buffer_km':True})[0],400)

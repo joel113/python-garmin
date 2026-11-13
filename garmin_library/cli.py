@@ -6,7 +6,7 @@ from garmin_library.activities import import_all
 from garmin_library.config import PROJECT_ROOT, Settings, load_dotenv
 from garmin_library.context import AppContext
 from garmin_library.exports import export_csv, export_map
-from garmin_library.garmin import fetch_new
+from garmin_library.garmin import fetch_new, fetch_equipment
 from garmin_library.server import serve
 
 
@@ -17,6 +17,9 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("import", help="Import FIT/GPX files from storage/activities/ (or GARMIN_ACTIVITIES_PATH)")
     sub.add_parser("fetch", help="Fetch new Garmin activities (requires GARMIN_API_KEY)")
+    equipment = sub.add_parser('fetch-equipment', help='Fetch missing or failed Garmin workout equipment')
+    equipment.add_argument('--activity-id', help='Fetch equipment for one locally imported activity')
+    equipment.add_argument('--refresh', action='store_true', help='Also refresh successfully fetched results')
     sub.add_parser("export-csv", help="Export session metadata to analysis/activities.csv")
     sub.add_parser("export-map", help="Export a static Folium map to analysis/activities_map.html")
     web = sub.add_parser("serve", help="Run the local activity map")
@@ -28,6 +31,8 @@ def main(argv=None):
         import_all(context)
     elif args.command == "fetch":
         fetch_new(context)
+    elif args.command == 'fetch-equipment':
+        fetch_equipment(context, args.activity_id, args.refresh)
     elif args.command == "export-csv":
         export_csv(context)
     elif args.command == "export-map":

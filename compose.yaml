@@ -8,6 +8,7 @@ services:
       - "127.0.0.1:${APP_PORT:-8001}:8000"
     environment:
       GARMIN_DB_PATH: /data/activities.sqlite3
+      GARMIN_NETWORK_ENGINE_URL: http://network-engine:8002
       GARMIN_ACTIVITIES_PATH: /data/activities
       GARMIN_ALLOWED_HOSTS: "localhost:${APP_PORT:-8001},127.0.0.1:${APP_PORT:-8001}"
       GARMIN_API_KEY: "${GARMIN_API_KEY:-}"
@@ -22,3 +23,16 @@ services:
       timeout: 10s
       start_period: 5m
       retries: 5
+
+  network-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.network
+    image: python-garmin-network:local
+    init: true
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      NETWORK_ROOT: /network
+    volumes:
+      - ./storage/network:/network
+    restart: unless-stopped

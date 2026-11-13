@@ -1,12 +1,77 @@
 """SQLite connection setup and additive schema upgrades."""
 from pathlib import Path
 import sqlite3
+import threading
+
+from garmin_library.network_schema import setup_network_schema
+
+_SCHEMA_LOCK = threading.Lock()
+_READY_SCHEMAS = set()
+_EXPECTED_LAYOUT = None
+
+
+def _schema_key(db, db_path):
+    identity = db_path.stat()
+    return (str(db_path.resolve()), identity.st_dev, identity.st_ino,
+            db.execute('PRAGMA schema_version').fetchone()[0])
+
+
+def _schema_is_current(db):
+    """Read-only fast path for a new CLI process sharing a busy library.
+
+    Derive the required layout from the same migrations in isolated memory, so
+    adding a table/column/index/trigger cannot silently bypass future upgrades.
+    Call with _SCHEMA_LOCK held; no personal data enters the reference database.
+    """
+    global _EXPECTED_LAYOUT
+    if _EXPECTED_LAYOUT is None:
+        reference = sqlite3.connect(':memory:')
+        reference.row_factory = sqlite3.Row
+        try:
+            _setup_schema(reference)
+            objects = {(row['type'], row['name']) for row in reference.execute(
+                "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+            columns = {name: {tuple(row) for row in reference.execute(
+                'SELECT name,type,"notnull",pk FROM pragma_table_info(?)', (name,))}
+                for kind, name in objects if kind == 'table'}
+            migrations = {row[0] for row in reference.execute('SELECT name FROM app_migrations')}
+            _EXPECTED_LAYOUT = objects, columns, migrations
+        finally:
+            reference.close()
+    objects, columns, migrations = _EXPECTED_LAYOUT
+    present = {(row[0], row[1]) for row in db.execute(
+        "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+    if not objects.issubset(present):
+        return False
+    for name, required in columns.items():
+        actual = {tuple(row) for row in db.execute(
+            'SELECT name,type,"notnull",pk FROM pragma_table_info(?)', (name,))}
+        if not required.issubset(actual):
+            return False
+    return migrations.issubset({row[0] for row in db.execute('SELECT name FROM app_migrations')})
 
 
 def connect(db_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(db_path, timeout=30)
     db.row_factory = sqlite3.Row
+    db.execute('PRAGMA foreign_keys = ON')
+    try:
+        # Existing connections need only reads, even while an importer holds the
+        # writer lock. Replacements and schema changes invalidate this cache.
+        if _schema_key(db, db_path) not in _READY_SCHEMAS:
+            with _SCHEMA_LOCK:
+                if _schema_key(db, db_path) not in _READY_SCHEMAS:
+                    if not _schema_is_current(db):
+                        _setup_schema(db)
+                    _READY_SCHEMAS.add(_schema_key(db, db_path))
+        return db
+    except Exception:
+        db.close()
+        raise
+
+
+def _setup_schema(db):
     db.executescript("""
       CREATE TABLE IF NOT EXISTS activities (
         id TEXT PRIMARY KEY, file_path TEXT NOT NULL, start_time TEXT,
@@ -22,6 +87,11 @@ def connect(db_path: Path):
         activity_id TEXT PRIMARY KEY REFERENCES activities(id) ON DELETE CASCADE,
         file_size INTEGER NOT NULL, file_mtime_ns INTEGER NOT NULL,
         status TEXT NOT NULL, message TEXT
+      );
+      CREATE TABLE IF NOT EXISTS activity_workouts (
+        activity_id TEXT PRIMARY KEY REFERENCES activities(id) ON DELETE CASCADE,
+        payload_json TEXT, fetched_at TEXT, last_attempt_at TEXT NOT NULL,
+        last_error TEXT
       );
       CREATE TABLE IF NOT EXISTS planned_routes (
         id TEXT PRIMARY KEY, source_hash TEXT NOT NULL UNIQUE, stored_filename TEXT NOT NULL,
@@ -153,7 +223,7 @@ def connect(db_path: Path):
                 progress_done=0,progress_total=0 WHERE id=1""")
         db.commit()
     setup_route_matching_queue(db)
-    return db
+    setup_network_schema(db)
 
 def setup_route_matching_queue(db):
     """Install durable per-route jobs once, preserving completed legacy caches."""

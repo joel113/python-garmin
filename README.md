@@ -36,6 +36,22 @@ uv run python app.py fetch
 
 The fetch command saves supported FIT or GPX files to `storage/activities/` and imports newly downloaded files. GPX distance and duration are derived from its track points and timestamps. Garmin API key and token details are documented in the [Personal API guide](https://developer.garmin.com/gc-developer-program/personal/personal-api/) and [FAQ](https://developer.garmin.com/gc-developer-program/personal/personal-faq/).
 
+Newly fetched activities also download their structured workout instructions and step equipment through Garmin's activity-workouts endpoint. **Tracks → Track details → Workout equipment** shows equipment categories, such as swim fins or kickboards, with their workout and step names. These are workout instructions, not proof of actual use or assignments of specific bikes/shoes from Garmin Gear. Track details read the local database and never request Garmin data themselves.
+
+Backfill equipment for already imported activities, or refresh previously fetched results:
+
+```bash
+uv run python app.py fetch-equipment
+uv run python app.py fetch-equipment --activity-id 123456789 --refresh
+uv run python app.py fetch-equipment --refresh
+```
+
+For the container's mounted library, use `podman compose run --rm app fetch-equipment` (or `docker compose run --rm app fetch-equipment`); the same options are supported. Use the same database configuration as your web server. These commands require `GARMIN_API_KEY` from `.env` or the environment.
+
+Backfill saves progress after every activity and normally skips successful results, including activities with no workouts or no specified equipment. Rerunning resumes missing/failed requests without re-downloading FIT/GPX files. `--refresh` also updates successful results; `--activity-id` limits the run to one local activity. Non-numeric local IDs are skipped. Requests are paced and retain bounded backoff for rate limits and transient errors. Authentication failure stops the run; individual failures are recorded without clearing older successful data. FIT/GPX reimports preserve this metadata. Equipment fetching does not invalidate geometry matching.
+
+The read-only `GET /api/track/{id}/equipment` endpoint exposes fetch status, timestamps, sanitized errors, distinct equipment types (excluding `NONE`), and ordered workout/step data. Unknown equipment identifiers remain available. Database backups include workout equipment; original FIT/GPX files alone cannot reconstruct it without another Garmin request.
+
 ## Start the web application
 
 ```bash
@@ -138,6 +154,57 @@ Activity imports/replacements/deletions, matching settings changes, and **Retry 
 
 Synthetic algorithm and SQLite lifecycle scenarios are provided in `tests/test_route_matching.py`. The backend refactor also includes configuration, CLI/import/export, HTTP compatibility/security, mocked Garmin, and worker lifecycle tests. Additional acceptance scenarios for an explicitly authorized verification session are: concurrent imports/settings changes must prevent stale publication; restarting during processing must resume work; both views must show identical metrics; pagination, counterpart navigation, unsaved route edits, map toggles/zoom, and simultaneous segment/speed/temperature overlays must work together. Verify source files, segment definitions, destination identities, and route notes remain intact after recalculation.
 
+## Street/path coverage heatmap
+
+### Newly explored paths per activity
+
+**Tracks → Track details → New paths** estimates the kilometres first recorded in your library, compared with strictly earlier cycling and running activities across both sports and either direction. The percentage uses **unique matched path distance**, not the recorded activity distance: laps and return journeys count once. A partially familiar street section contributes only its newly covered portion. Equal activity start times do not count as earlier history. Timestamps without an offset are interpreted as UTC.
+
+Enable **Highlight new paths** to draw newly explored portions on the matched street/path geometry in magenta with a white outline. This option starts off and works independently of speed/temperature colors, route matches, and segment overlays. It preserves the map zoom. Use **Refresh exploration** after background matching completes or history changes.
+
+The feature uses existing published map matches for both historical and newly imported activities; it does not fetch Garmin data, build maps, or rematch tracks. Estimates are calculated on demand from a consistent database snapshot, so importing or deleting older activities and replacing published maps updates the comparison. Incomplete earlier matches or missing history dates make an estimate provisional. Unmatched GPS samples and paths outside installed coverage are unknown, not automatically new. A missing activity date, unsupported sport, pending/failed match, or zero matched distance is shown explicitly rather than as a zero-percent result.
+
+`GET /api/track/{id}/exploration` returns availability, estimated `new_m`, `matched_unique_m`, `new_percent`, and history/coverage completeness. Add `?geometry=1` for newly explored portions as a GeoJSON FeatureCollection. The additive contribution index supports lookups by generation and section without scanning the full network. Installing the updated schema may require a database write lock while that index is created; original data and completed matches remain intact.
+
+### Heatmap setup
+
+Choose **Heatmap → Street/path coverage** for a unified view of recorded cycling and running on OpenStreetMap streets and paths. The existing Overlapping routes and Individual tracks modes remain available. This feature starts **unconfigured**: it does not download regional maps or send historical tracks anywhere on startup.
+
+Expand **Street/path map setup** and use **Around my tracks** (the default). Set the buffer on each side of your tracks, normally **2 km**, then choose **Preview track-based coverage**. The app scans usable cycling/running tracks locally, ignores pre-activity timestamps and GPS discontinuities, and creates separate corridors around scattered trips. It does not fill the enormous bounding rectangle between distant rides. Preview shows the area, number of activities, automatically chosen smaller Geofabrik extracts, total download size, and a minimum temporary source-workspace estimate. **Fit preview** shows the proposed area on the map. Preview fetches metadata only; it downloads no OSM extracts and uploads no GPS traces.
+
+Choose **Build cropped coverage** to proceed. Sources are downloaded **one at a time**, cropped to the track corridor plus a 1 km routing margin, and removed as soon as each crop succeeds. The graph is built from the compact crops, and SQLite imports only the requested display corridor. The routing margin and complete-way extraction preserve connectivity without marking streets outside the requested area as covered. A positive buffer from 0.25 to 20 km is supported. Partial crop manifests let interrupted builds reuse completed crops. Existing coverage remains available during rebuilding.
+
+The source-workspace estimate is based on 2.5 times the largest proposed extract plus 512 MiB, rather than six times a DACH-wide download. Additional graph-build space is checked against the **actual cropped size**. These are minimum safety checks, not exact final-size promises: a source extract still has to be downloaded before it can be cropped. Preview cannot guarantee a tiny download where the provider offers only a large extract. After building, the status reports cropped input size and retained routing-file size; coverage rows and statistics additionally occupy SQLite.
+
+**Whole selected regions** remains available for deliberate full-region coverage. In that mode select all desired named regions and review the larger download/workspace requirements. Cancel a previously staged DACH/full-region setup before starting the smaller track-based build. Cancel stops its engine subprocess, while preserving the currently published graph. Retry resumes failed work. New tracks outside an installed corridor are reported as needing expansion; preview and Build again to include them. Expansion never automatically starts large downloads.
+
+The map uses these encodings:
+
+- **Cycling / Running:** blue-to-red median recorded speed for each short network section. The red reference is the published sport's 95th percentile, so occasional fast sections do not dominate the scale.
+- **Line width:** logarithmic frequency by distinct activity, from 2 to 10 pixels. Repeated laps or opposite-direction passes in the same activity count once, while their distance and recorded elapsed time contribute to that activity's speed.
+- **All included sports:** cycling plus running frequency in a neutral color; their speed distributions are not pooled.
+- **Thin gray:** no qualifying recorded coverage for the selected sport. Purple visited sections have no usable recorded speed. Outside installed regions means unknown coverage, not unvisited.
+
+Hover for the street/path name, activity count, typical speed, and speed sample count. Click a section for a paginated activity list and links to Tracks. Turn off **Show unvisited paths** to show recorded coverage alone. Low-zoom tiles are simplified; gray paths appear from zoom 12, and zoom 15+ provides local street/path detail. Network sections are approximately 25 m and preserve partially traversed intervals, so following part of a long OSM way does not mark the whole way visited.
+
+Speed comes from original GPS timestamps projected onto the matched path, never Valhalla's estimated road speeds. Each activity contributes its aggregate elapsed speed on a section, including continuously recorded stops, and the displayed typical value is the median across activities. Missing/non-increasing timestamps, intervals longer than five minutes, and implausible speeds do not contribute speed samples; usable geometry can still contribute frequency. Unmatched, low-confidence, off-network, and discontinuous portions are not connected artificially. Initial scope is exact `cycling` and `running` sport values; unknown-sport GPX and other sports are counted as excluded. Planned Routes never contribute.
+
+Compose runs a separate **network-engine** service using pinned Valhalla 3.6.3. It is reachable only on the internal Compose network, mounts only `storage/network/`, and does not receive Garmin credentials or the personal SQLite database. Matching requests remain local. Regional PBF downloads come from Geofabrik; existing map tiles and browser assets still use their normal internet providers. Network data retains OpenStreetMap attribution.
+
+The graph and displayed network are built from the same merged OSM snapshot. Overlapping extracts are deduplicated and resolved to their latest object versions. SQLite stores short network sections, spatial bounds, per-activity contributions, aggregates, source revisions, and durable jobs. Data under `storage/network/sources/` and `storage/network/generations/` stores downloaded extracts, checksums, routing tiles, logs, and manifests. Keep this directory with SQLite when preserving the built layer; derived coverage can also be rebuilt from original activity files and regional downloads. Builds do not modify original FIT/GPX files, saved segments, destination identities, or planned routes.
+
+New/replaced activities queue only their own matching jobs; deletion removes their contributions and recalculates affected section aggregates. A single server worker retries transient service errors, resumes interrupted work, and prevents stale jobs from publishing. Region or corridor changes build and match a staging graph; the previous published graph remains visible until the new generation and its aggregates are ready. Requests pin their graph generation so old and new tiles cannot mix. Failed activities are reported and can be retried before a staged graph is published. Full source downloads, merged PBFs, and compact crop intermediates are removed after they are no longer needed. Active/staging routing graphs are always protected. Superseded or cancelled generations are pruned after a 10-minute grace period, including their derived SQLite rows; the cleanup worker retries when the engine is busy. Only generation-owned map artifacts are removed, never FIT/GPX originals or user definitions. Freed SQLite pages are reused by later builds; deleting derived rows does not necessarily shrink an already-large SQLite file on disk.
+
+For direct `uv` use, `GARMIN_NETWORK_ENGINE_URL` defaults to `http://127.0.0.1:8002`. Run the engine image with a localhost-published port and mount the configured database's adjacent `network/` directory at `/network`. The standard Compose setup sets `http://network-engine:8002` internally and needs no host-published engine port.
+
+An explicitly authorized, repeatable integration check is available using **only synthetic OSM and GPS fixtures**. Mount a scratch directory as `/network` in a dedicated engine container on localhost port 18002, then run:
+
+```bash
+uv run python tests/network_smoke.py --shared-root /path/to/the/scratch-directory --engine-url http://127.0.0.1:18002 --track-crop
+```
+
+This crops a tiny artificial street grid to a local corridor, matches noisy cycling and reverse running traces, publishes a temporary database, decodes visited/unvisited vector tiles, and confirms matching still works after intermediate cleanup. It performs no Garmin fetch and downloads no regional extracts. Stop the dedicated test container before removing its scratch directory.
+
 ## Run with Docker Compose
 
 Install Docker with Compose support (for example Docker Desktop), then use the commands below from the project root. The container runs Python 3.12 with dependencies installed from `uv.lock` during the build; it does not install packages at startup.
@@ -151,13 +218,14 @@ storage/
 ├── activities.sqlite3
 ├── activities/         # Original FIT/GPX activities
 ├── routes/             # Original planned GPX routes
+├── network/            # Downloaded regional OSM data, routing graphs, and manifests
 └── backups/            # Dated database backups
 ```
 
 If upgrading from the old root-level `activities/` folder, follow **Move an existing activity directory once** below before creating the destination directory.
 
 ```bash
-mkdir -p storage/activities analysis
+mkdir -p storage/activities storage/network analysis
 id -u
 id -g
 ```

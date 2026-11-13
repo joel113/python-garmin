@@ -1,0 +1,6 @@
+FROM ghcr.io/valhalla/valhalla:3.6.3
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends osmium-tool && rm -rf /var/lib/apt/lists/*
+COPY network_engine/service.py /opt/network-service.py
+ENV PYTHONUNBUFFERED=1
+ENTRYPOINT ["python3", "/opt/network-service.py"]

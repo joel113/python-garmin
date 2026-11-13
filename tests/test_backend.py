@@ -102,12 +102,13 @@ class BackendTests(TemporaryLibrary, unittest.TestCase):
         archive=io.BytesIO()
         with zipfile.ZipFile(archive,'w') as zipped:zipped.writestr('activity.gpx',GPX)
         context=AppContext(replace(self.context.settings,api_key='test-key'))
-        with patch('garmin_library.garmin.api_request',side_effect=[b'one.two.three',json.dumps([{'activityId':123}]).encode(),archive.getvalue()]) as request, patch('garmin_library.garmin.time.sleep'), redirect_stdout(io.StringIO()):
+        with patch('garmin_library.garmin.api_request',side_effect=[b'one.two.three',json.dumps([{'activityId':123}]).encode(),archive.getvalue(),b'[]']) as request, patch('garmin_library.garmin.time.sleep'), redirect_stdout(io.StringIO()):
             fetch_new(context)
         self.assertEqual(request.call_args_list[0].args[1:3],('test-key','POST'))
         self.assertEqual(request.call_args_list[0].kwargs['auth_scheme'],'ApiKey')
         self.assertEqual(request.call_args_list[1].args[1],'one.two.three')
         self.assertEqual((context.settings.activities_path/'123.gpx').read_bytes(),GPX)
+        self.assertTrue(request.call_args_list[-1].args[0].endswith('/activity-service/activity/123/workouts'))
         with closing(context.connect()) as db:self.assertEqual(db.execute('SELECT id FROM activities').fetchone()[0],'123')
 
     def test_garmin_retries_are_bounded_and_honor_authorization(self):

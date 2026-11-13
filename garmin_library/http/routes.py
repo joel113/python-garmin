@@ -4,6 +4,7 @@ from __future__ import annotations
 from contextlib import closing
 from urllib.parse import parse_qs, unquote, urlsplit
 import logging
+import sqlite3
 import uuid
 
 from garmin_library.errors import AppError
@@ -165,6 +166,13 @@ def handle(handler, method):
             raise AppError(405, "Method not allowed.")
     except AppError as exc:
         handler.send_json({"error": exc.message}, exc.status)
+    except sqlite3.OperationalError as exc:
+        if 'locked' in str(exc).lower() or 'busy' in str(exc).lower():
+            LOG.warning('Route request blocked by a database writer: %s',exc)
+            handler.send_json({'error':'The database is busy with background work. Please retry your route upload or change shortly.'},503)
+        else:
+            LOG.exception('Routes database request failed')
+            handler.send_json({'error':'The route request could not be completed. Please retry.'},500)
     except Exception:
         LOG.exception("Routes API request failed")
         handler.send_json({"error": "The route request could not be completed. Please retry."}, 500)

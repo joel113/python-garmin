@@ -211,9 +211,15 @@ def import_file(db: sqlite3.Connection, path: Path) -> bool:
                                str(record.get_value("timestamp") or ""), record.get_value("altitude"),
                                temperature_value(record.get_value("temperature"))))
         old = db.execute("SELECT sport FROM activities WHERE id=?", (aid,)).fetchone()
+        # Snapshot under the writer lock so concurrent metadata refreshes cannot
+        # be lost when the activity and its cascading children are replaced.
+        db.execute("BEGIN IMMEDIATE")
+        workouts = db.execute("SELECT activity_id,payload_json,fetched_at,last_attempt_at,last_error FROM activity_workouts WHERE activity_id=?", (aid,)).fetchone()
         db.execute("DELETE FROM activities WHERE id=?", (aid,))
         db.execute("INSERT INTO activities(id,file_path,start_time,sport,duration_s,distance_m) VALUES(?,?,?,?,?,?)",
                    (aid, str(Path("storage/activities") / path.name), str(meta["start_time"] or ""), meta["sport"], meta["duration_s"], meta["distance_m"]))
+        if workouts is not None:
+            db.execute("INSERT INTO activity_workouts(activity_id,payload_json,fetched_at,last_attempt_at,last_error) VALUES(?,?,?,?,?)", tuple(workouts))
         db.executemany("INSERT INTO track_points(activity_id,seq,lat,lon,timestamp,altitude,temperature_c) VALUES(?,?,?,?,?,?,?)", points)
         available = any(p[6] is not None for p in points)
         db.execute("INSERT INTO activity_temperature_cache VALUES(?,?,?,?,?)",
